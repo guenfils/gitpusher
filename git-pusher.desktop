@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Git Pusher
+GenericName=GitHub & GitLab Uploader
+Comment=Upload any project to GitHub and GitLab in one click
+Exec=git-pusher
+Icon=git-pusher
+Terminal=false
+StartupNotify=true
+Categories=Development;RevisionControl;
+Keywords=git;github;gitlab;push;upload;repository;
+MimeType=inode/directory;
+StartupWMClass=git-pusher

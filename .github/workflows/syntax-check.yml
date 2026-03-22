@@ -1,0 +1,63 @@
+name: Syntax Check
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check syntax — core
+        run: |
+          python3 -m py_compile core/git_manager.py
+          python3 -m py_compile core/github_api.py
+          python3 -m py_compile core/gitlab_api.py
+          python3 -m py_compile core/config_manager.py
+          python3 -m py_compile core/ssh_manager.py
+          python3 -m py_compile core/gitignore_manager.py
+          python3 -m py_compile core/secret_scanner.py
+
+      - name: Check syntax — ui
+        run: |
+          python3 -m py_compile ui/app.py
+          python3 -m py_compile ui/theme.py
+          python3 -m py_compile ui/manage_view.py
+          python3 -m py_compile ui/widgets/common.py
+          for f in ui/steps/*.py ui/panels/*.py; do
+            python3 -m py_compile "$f"
+          done
+
+      - name: Verify all imports
+        run: |
+          python3 -c "
+          import sys
+          sys.path.insert(0, '.')
+          import ast, os
+          errors = []
+          for root, dirs, files in os.walk('.'):
+              dirs[:] = [d for d in dirs if d not in ['__pycache__','.git','build','dist']]
+              for f in files:
+                  if f.endswith('.py'):
+                      path = os.path.join(root, f)
+                      try:
+                          ast.parse(open(path).read())
+                      except SyntaxError as e:
+                          errors.append(f'{path}: {e}')
+          if errors:
+              for e in errors: print('ERROR:', e)
+              sys.exit(1)
+          print(f'All Python files pass syntax check.')
+          "
