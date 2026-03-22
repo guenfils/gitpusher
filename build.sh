@@ -32,7 +32,10 @@ echo -e "  ${GREEN}✓${RESET}  Python ${PY_VER}"
 
 # ── 2. pip dependencies ───────────────────────────────────────────────────────
 echo -e "  ${DIM}Installing dependencies from requirements.txt...${RESET}"
-pip3 install -q -r requirements.txt
+if ! pip3 install -q -r requirements.txt 2>/dev/null; then
+    # Externally-managed environment (PEP 668) — try with flag, else rely on pre-installed
+    pip3 install -q --break-system-packages -r requirements.txt 2>/dev/null || true
+fi
 echo -e "  ${GREEN}✓${RESET}  Dependencies installed"
 
 # ── 3. Verify key imports ─────────────────────────────────────────────────────
