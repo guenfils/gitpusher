@@ -46,8 +46,13 @@ ok "git $(git --version | awk '{print $3}')"
 # gh CLI (optional but recommended)
 HAS_GH=false
 if command -v gh &>/dev/null; then
-    HAS_GH=true
-    ok "gh CLI $(gh --version | head -1 | awk '{print $3}')"
+    if gh auth status &>/dev/null 2>&1; then
+        HAS_GH=true
+        ok "gh CLI $(gh --version | head -1 | awk '{print $3}') (authenticated)"
+    else
+        warn "gh CLI found but not authenticated — will use git + curl instead"
+        echo -e "    ${DIM}Run: gh auth login${RESET}"
+    fi
 else
     warn "gh CLI not found — will use git + curl instead"
     echo -e "    ${DIM}Install gh CLI for a better experience: https://cli.github.com${RESET}"
