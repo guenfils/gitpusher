@@ -330,16 +330,9 @@ step "4/7" "Pushing code"
 push_to_remote() {
     local NAME=$1 URL_HTTPS=$2 TOKEN=$3 PLATFORM=$4
 
-    # Build authenticated URL
-    # For GitHub: prefer gh CLI token (works with new repos created by gh CLI)
+    # Build authenticated URL using the provided token
     if [ "$PLATFORM" = "github" ]; then
-        local EFFECTIVE_TOKEN="$TOKEN"
-        if $HAS_GH; then
-            local CLI_TOKEN
-            CLI_TOKEN=$(gh auth token 2>/dev/null || echo "")
-            [ -n "$CLI_TOKEN" ] && EFFECTIVE_TOKEN="$CLI_TOKEN"
-        fi
-        AUTH_URL="https://${GH_USER}:${EFFECTIVE_TOKEN}@${URL_HTTPS#https://}"
+        AUTH_URL="https://${GH_USER}:${TOKEN}@${URL_HTTPS#https://}"
     else
         AUTH_URL="https://oauth2:${TOKEN}@${URL_HTTPS#https://}"
     fi
