@@ -16,6 +16,7 @@ from ui.panels.panel_accounts import PanelAccounts
 from ui.panels.panel_scheduled import PanelScheduled
 from ui.panels.panel_watch import PanelWatch
 from ui.panels.panel_novadeploy import PanelNovaDeploy
+from ui.panels.panel_test_debugging import PanelTestDebugging
 from ui.panels.panel_stats import PanelStats
 from ui.panels.panel_export import PanelExport
 from ui.panels.panel_stash    import PanelStash
@@ -40,6 +41,7 @@ TABS = [
     ("Scheduled Push", PanelScheduled),
     ("Watch Mode",     PanelWatch),
     ("NovaDeploy",     PanelNovaDeploy),
+    ("Test & Debugging", PanelTestDebugging),
     ("Statistics",     PanelStats),
     ("Export / Backup", PanelExport),
     ("Stash",         PanelStash),
@@ -64,6 +66,7 @@ TAB_ICONS = [
     "  Scheduled Push",
     "  Watch Mode",
     "  NovaDeploy",
+    "  Test & Debugging",
     "  Statistics",
     "  Export / Backup",
     "  Stash",
@@ -127,7 +130,7 @@ class ManageView(ctk.CTkFrame):
                     font=ctk.CTkFont(family="Inter", size=10),
                     text_color=TEXT_MUTED,
                 ).pack(padx=PAD_SM, pady=(PAD_SM, 2), anchor="w")
-            if i == 16:  # Git Tools section divider
+            if i == 17:  # Git Tools section divider
                 ctk.CTkLabel(
                     scroll, text="── Git Tools ──",
                     font=ctk.CTkFont(family="Inter", size=10),
