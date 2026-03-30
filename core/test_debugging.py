@@ -17,6 +17,9 @@ MAX_INCIDENTS = 50
 MAX_PLAN_STEPS = 12
 MAX_REPAIR_ATTEMPTS = 5
 SAFETY_GATE_CATEGORIES = ("typecheck", "test", "build")
+DEFAULT_ALLOWED_PUSH_BRANCHES = ("main", "master", "develop", "staging", "release")
+DEFAULT_ALLOWED_PUSH_REMOTES = ("origin", "gitlab")
+APPROVAL_QUEUE_ACTIONS = ("repair", "commit", "push")
 APP_ROOT = Path(__file__).resolve().parent.parent
 REPAIR_AGENT_PATH = APP_ROOT / "core" / "repair_agent.py"
 DEFAULT_REPAIR_COMMAND_TEMPLATE = (
@@ -113,6 +116,41 @@ class TestDebugSystem:
         mode = dict(APPROVAL_MODES[key])
         mode["key"] = key
         return mode
+
+    def default_push_policy(self):
+        return {
+            "allow_auto_push": False,
+            "allowed_branches": list(DEFAULT_ALLOWED_PUSH_BRANCHES),
+            "allowed_remotes": list(DEFAULT_ALLOWED_PUSH_REMOTES),
+            "require_clean_start": True,
+        }
+
+    def normalize_push_policy(self, policy=None):
+        defaults = self.default_push_policy()
+        source = dict(policy or {})
+        normalized = {
+            "allow_auto_push": bool(source.get("allow_auto_push", defaults["allow_auto_push"])),
+            "allowed_branches": self._normalize_csv_list(
+                source.get("allowed_branches", defaults["allowed_branches"]),
+                fallback=defaults["allowed_branches"],
+            ),
+            "allowed_remotes": self._normalize_csv_list(
+                source.get("allowed_remotes", defaults["allowed_remotes"]),
+                fallback=defaults["allowed_remotes"],
+            ),
+            "require_clean_start": bool(source.get("require_clean_start", defaults["require_clean_start"])),
+            "source": str(source.get("source") or "manual").strip() or "manual",
+        }
+        return normalized
+
+    def _normalize_csv_list(self, value, fallback=None):
+        if isinstance(value, (list, tuple, set)):
+            items = [str(item).strip() for item in value if str(item).strip()]
+        else:
+            items = [chunk.strip() for chunk in str(value or "").split(",") if chunk.strip()]
+        if items:
+            return items
+        return [str(item).strip() for item in (fallback or []) if str(item).strip()]
 
     def _discover_node_runtime(self):
         system_node = shutil.which("node")
@@ -379,7 +417,20 @@ class TestDebugSystem:
         return f"{prefix}-{stamp}"
 
     def inspect_automation_history(self, incident):
-        deployment_dir = Path(incident.get("deployment_dir") or "").expanduser()
+        deployment_dir_raw = str((incident or {}).get("deployment_dir") or "").strip()
+        if not deployment_dir_raw:
+            return {
+                "ok": False,
+                "history_file": "",
+                "entries": [],
+                "entry_count": 0,
+                "latest_entry": None,
+                "latest_run_id": "",
+                "latest_run_entries": [],
+                "badge_status": "pending",
+                "badge_text": "No automation activity",
+            }
+        deployment_dir = Path(deployment_dir_raw).expanduser()
         history_file = deployment_dir / "automation-history.jsonl"
         entries = []
         if history_file.exists():
@@ -463,6 +514,130 @@ class TestDebugSystem:
             "history_file": str(history_file),
             "entry": payload,
         }
+
+    def inspect_approval_queue(self, incident):
+        deployment_dir_raw = str((incident or {}).get("deployment_dir") or "").strip()
+        if not deployment_dir_raw:
+            return {
+                "ok": False,
+                "queue_file": "",
+                "items": [],
+                "pending_items": [],
+                "latest_pending": None,
+                "counts": {"pending": 0, "approved": 0, "rejected": 0, "total": 0},
+            }
+        deployment_dir = Path(deployment_dir_raw).expanduser()
+        queue_file = deployment_dir / "approval-queue.json"
+        payload = self._read_json(queue_file)
+        items = []
+        if isinstance(payload, dict):
+            items = payload.get("items") or []
+        items = [item for item in items if isinstance(item, dict)]
+        items.sort(key=lambda item: str(item.get("created_at") or ""))
+        pending = [item for item in items if str(item.get("status") or "").strip() == "pending"]
+        latest_pending = pending[-1] if pending else None
+        return {
+            "ok": bool(items),
+            "queue_file": str(queue_file),
+            "items": items[-30:],
+            "pending_items": pending,
+            "latest_pending": latest_pending,
+            "counts": {
+                "pending": len(pending),
+                "approved": len([item for item in items if item.get("status") == "approved"]),
+                "rejected": len([item for item in items if item.get("status") == "rejected"]),
+                "total": len(items),
+            },
+        }
+
+    def enqueue_approval_request(
+        self,
+        incident,
+        *,
+        action,
+        message,
+        run_id="",
+        source="auto",
+        metadata=None,
+    ):
+        action = str(action or "").strip().lower()
+        if action not in APPROVAL_QUEUE_ACTIONS:
+            return {"ok": False, "reason": "unsupported approval action"}
+        if not str((incident or {}).get("deployment_dir") or "").strip():
+            return {"ok": False, "reason": "deployment dir unavailable"}
+        queue = self.inspect_approval_queue(incident)
+        queue_file = Path(queue["queue_file"])
+        items = list(queue.get("items") or [])
+        for item in reversed(items):
+            if (
+                str(item.get("status") or "") == "pending"
+                and str(item.get("action") or "") == action
+                and str(item.get("run_id") or "") == str(run_id or "").strip()
+            ):
+                item["message"] = str(message or "").strip()
+                item["metadata"] = metadata or item.get("metadata") or {}
+                queue_file.write_text(json.dumps({"items": items}, indent=2), encoding="utf-8")
+                return {"ok": True, "item": item, "queue_file": str(queue_file), "deduped": True}
+
+        approval_id = f"{action}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+        item = {
+            "id": approval_id,
+            "action": action,
+            "status": "pending",
+            "message": str(message or "").strip(),
+            "run_id": str(run_id or "").strip(),
+            "source": str(source or "auto").strip() or "auto",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "metadata": metadata or {},
+        }
+        items.append(item)
+        queue_file.parent.mkdir(parents=True, exist_ok=True)
+        queue_file.write_text(json.dumps({"items": items}, indent=2), encoding="utf-8")
+        return {"ok": True, "item": item, "queue_file": str(queue_file), "deduped": False}
+
+    def resolve_approval_request(
+        self,
+        incident,
+        *,
+        action="",
+        approval_id="",
+        decision="approved",
+        note="",
+        metadata=None,
+    ):
+        if not str((incident or {}).get("deployment_dir") or "").strip():
+            return {"ok": False, "reason": "deployment dir unavailable"}
+        queue = self.inspect_approval_queue(incident)
+        queue_file = Path(queue["queue_file"])
+        items = list(queue.get("items") or [])
+        decision = str(decision or "approved").strip().lower()
+        if decision not in {"approved", "rejected"}:
+            decision = "approved"
+
+        selected = None
+        for item in reversed(items):
+            if str(item.get("status") or "") != "pending":
+                continue
+            if approval_id and str(item.get("id") or "") == str(approval_id):
+                selected = item
+                break
+            if action and str(item.get("action") or "") == str(action):
+                selected = item
+                break
+            if not approval_id and not action:
+                selected = item
+                break
+
+        if not selected:
+            return {"ok": False, "reason": "no pending approval request found"}
+
+        selected["status"] = decision
+        selected["resolved_at"] = datetime.now(timezone.utc).isoformat()
+        selected["resolution_note"] = str(note or "").strip()
+        selected["resolution_metadata"] = metadata or {}
+        queue_file.parent.mkdir(parents=True, exist_ok=True)
+        queue_file.write_text(json.dumps({"items": items}, indent=2), encoding="utf-8")
+        return {"ok": True, "item": selected, "queue_file": str(queue_file)}
 
     def _read_json(self, path):
         try:
@@ -560,6 +735,7 @@ class TestDebugSystem:
 
         branch = self._git.get_current_branch(str(root)) or "unknown"
         remote_url = self._git.get_remote_url(str(root), "origin")
+        remotes = self._git.get_remotes(str(root))
         last_commit = self._git.get_last_commit(str(root)) or {}
         status_text = self._git.get_status(str(root))
         status_lines = [line for line in status_text.splitlines() if line.strip()]
@@ -569,15 +745,51 @@ class TestDebugSystem:
             for line in status_lines
             if line.startswith("?? ")
         ]
+        tracked_changes = [line for line in status_lines if not line.startswith("?? ")]
+        diff_stat = self._git_capture(
+            root,
+            ["git", "diff", "--stat", "--compact-summary"],
+        )
+        diff_files = [
+            line.strip()
+            for line in self._git_capture(root, ["git", "diff", "--name-only"]).splitlines()
+            if line.strip()
+        ]
+        upstream = self._git_capture(
+            root,
+            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        )
+        ahead = 0
+        behind = 0
+        if upstream:
+            ahead_behind = self._git_capture(
+                root,
+                ["git", "rev-list", "--left-right", "--count", f"HEAD...{upstream}"],
+            )
+            try:
+                ahead_value, behind_value = [int(chunk) for chunk in ahead_behind.split()]
+                ahead = ahead_value
+                behind = behind_value
+            except Exception:
+                ahead = 0
+                behind = 0
         return {
             "ok": True,
             "repo_path": str(root),
             "branch": branch,
             "remote_url": remote_url,
+            "remotes": remotes,
             "last_commit": last_commit,
             "status_lines": status_lines,
             "changed_files": changed_files,
             "untracked_files": untracked,
+            "tracked_change_count": len(tracked_changes),
+            "untracked_count": len(untracked),
+            "diff_stat": diff_stat,
+            "diff_files": diff_files,
+            "upstream": upstream,
+            "ahead": ahead,
+            "behind": behind,
             "dirty": bool(status_lines),
         }
 
@@ -695,10 +907,21 @@ class TestDebugSystem:
                 f"{last_commit.get('hash') or 'unknown'} | "
                 f"{last_commit.get('message') or 'No message'}"
             )
+        if repo_state.get("upstream"):
+            lines.append(
+                f"Upstream: {repo_state.get('upstream')} | ahead {repo_state.get('ahead') or 0} / behind {repo_state.get('behind') or 0}"
+            )
+        remotes = repo_state.get("remotes") or {}
+        if remotes:
+            remote_names = ", ".join(sorted(remotes.keys()))
+            lines.append(f"Remotes: {remote_names}")
         changed_files = repo_state.get("changed_files") or []
         untracked_files = repo_state.get("untracked_files") or []
         status_lines = repo_state.get("status_lines") or []
         lines.append(f"Status entries: {len(status_lines)}")
+        diff_stat = str(repo_state.get("diff_stat") or "").strip()
+        if diff_stat:
+            lines.extend(["", "Diff stat:", diff_stat])
         if changed_files:
             lines.append("")
             lines.append("Changed files:")
@@ -734,6 +957,210 @@ class TestDebugSystem:
             lines.append("")
             lines.append("No required typecheck/test/build gates were detected for this plan.")
 
+        return "\n".join(lines)
+
+    def evaluate_push_guard(
+        self,
+        repo_state,
+        *,
+        initial_repo_state=None,
+        push_github=False,
+        push_gitlab=False,
+        policy=None,
+    ):
+        policy = self.normalize_push_policy(policy)
+        target_remotes = []
+        if push_github:
+            target_remotes.append("origin")
+        if push_gitlab:
+            target_remotes.append("gitlab")
+
+        issues = []
+        warnings = []
+        if not repo_state.get("ok"):
+            issues.append(repo_state.get("error", "Repository state unavailable."))
+        branch = str(repo_state.get("branch") or "").strip()
+        remotes = repo_state.get("remotes") or {}
+        if target_remotes and branch and branch not in policy["allowed_branches"]:
+            issues.append(
+                f"Branch '{branch}' is not in the allowed push list: {', '.join(policy['allowed_branches'])}."
+            )
+        for remote_name in target_remotes:
+            if remote_name not in remotes:
+                issues.append(f"Remote '{remote_name}' is not configured in this repository.")
+            elif remote_name not in policy["allowed_remotes"]:
+                issues.append(
+                    f"Remote '{remote_name}' is not in the allowed push list: {', '.join(policy['allowed_remotes'])}."
+                )
+
+        if policy["source"] == "auto" and target_remotes and not policy["allow_auto_push"]:
+            issues.append("Auto-push is disabled for this repository.")
+
+        initial_repo_state = initial_repo_state or {}
+        if policy["require_clean_start"] and initial_repo_state.get("dirty"):
+            issues.append("The repository was already dirty before the automated flow started.")
+
+        if target_remotes and repo_state.get("dirty"):
+            warnings.append("Repository still has local changes; push should happen from a clean committed state.")
+        if target_remotes and repo_state.get("behind"):
+            warnings.append("Repository is behind its upstream branch; pushing may need a sync first.")
+
+        ok = not issues
+        if ok:
+            summary = "Push guard open."
+        else:
+            summary = "Push guard blocked."
+
+        return {
+            "ok": ok,
+            "summary": summary,
+            "issues": issues,
+            "warnings": warnings,
+            "policy": policy,
+            "target_remotes": target_remotes,
+            "branch": branch,
+        }
+
+    def format_push_guard(self, guard):
+        if not guard:
+            return "Push guard not evaluated yet."
+        lines = [guard.get("summary") or "Push guard unavailable."]
+        policy = guard.get("policy") or {}
+        lines.append(
+            "Allowed branches: " + ", ".join(policy.get("allowed_branches") or ["none"])
+        )
+        lines.append(
+            "Allowed remotes: " + ", ".join(policy.get("allowed_remotes") or ["none"])
+        )
+        lines.append(f"Auto-push allowed: {'yes' if policy.get('allow_auto_push') else 'no'}")
+        if guard.get("target_remotes"):
+            lines.append("Target remotes: " + ", ".join(guard["target_remotes"]))
+        if guard.get("issues"):
+            lines.append("")
+            lines.append("Blocking issues:")
+            for item in guard["issues"]:
+                lines.append(f"- {item}")
+        if guard.get("warnings"):
+            lines.append("")
+            lines.append("Warnings:")
+            for item in guard["warnings"]:
+                lines.append(f"- {item}")
+        return "\n".join(lines)
+
+    def build_debug_context(self, incident, repair_history, repo_state):
+        latest_attempt = ((repair_history or {}).get("latest_attempt")) or {}
+        diff_stat = str((repo_state or {}).get("diff_stat") or "").strip()
+        diff_files = (repo_state or {}).get("diff_files") or []
+        ai_summary = str(latest_attempt.get("ai_summary") or "").strip()
+        context = {
+            "project": str((incident or {}).get("project_name") or (incident or {}).get("project_id") or "").strip(),
+            "deployment_id": str((incident or {}).get("deployment_id") or "").strip(),
+            "summary": self.strip_log_tags(str((incident or {}).get("summary") or "").strip()),
+            "failed_step_name": str(latest_attempt.get("failed_step_name") or "").strip(),
+            "failed_step_command": str(latest_attempt.get("failed_step_command") or "").strip(),
+            "diagnosis_category": str(latest_attempt.get("diagnosis_category") or "").strip(),
+            "diagnosis_hint": str(latest_attempt.get("diagnosis_hint") or "").strip(),
+            "ai_summary": ai_summary,
+            "diff_stat": diff_stat,
+            "diff_files": diff_files[:12],
+        }
+        return context
+
+    def format_debug_context(self, context):
+        if not context:
+            return "No debug context available yet."
+        lines = [
+            f"Project: {context.get('project') or 'unknown'}",
+            f"Deployment: {context.get('deployment_id') or 'unknown'}",
+            f"Summary: {context.get('summary') or 'No summary'}",
+            f"Failed step: {context.get('failed_step_name') or 'unknown'}",
+        ]
+        if context.get("failed_step_command"):
+            lines.append(f"Command: {context['failed_step_command']}")
+        if context.get("diagnosis_category") or context.get("diagnosis_hint"):
+            lines.append(
+                "Diagnosis: "
+                f"{context.get('diagnosis_category') or 'unknown'}"
+                + (f" | {context.get('diagnosis_hint')}" if context.get("diagnosis_hint") else "")
+            )
+        if context.get("ai_summary"):
+            lines.extend(["", "AI summary:", context["ai_summary"]])
+        if context.get("diff_stat"):
+            lines.extend(["", "Diff stat:", context["diff_stat"]])
+        elif context.get("diff_files"):
+            lines.extend(["", "Changed files:"])
+            for item in context["diff_files"]:
+                lines.append(item)
+        return "\n".join(lines)
+
+    def build_incident_metrics(self, incident, automation_history=None, repair_history=None, approval_queue=None):
+        automation_history = automation_history or {}
+        repair_history = repair_history or {}
+        approval_queue = approval_queue or {}
+        entries = automation_history.get("entries") or []
+        attempts = repair_history.get("attempts") or []
+        pending_approvals = approval_queue.get("pending_items") or []
+        run_ids = {
+            str(item.get("run_id") or "").strip()
+            for item in entries
+            if str(item.get("run_id") or "").strip()
+        }
+        commit_events = [
+            item for item in entries
+            if str(item.get("event") or "").strip() in {"flow_committed", "flow_commit_local_only"}
+        ]
+        push_events = [
+            item for item in entries
+            if str(item.get("event") or "").strip() == "flow_pushed"
+        ]
+        handoff_events = [
+            item for item in entries
+            if str(item.get("event") or "").strip() == "flow_handoff_ready"
+        ]
+        durations = ""
+        if len(entries) >= 2:
+            try:
+                started = datetime.fromisoformat(str(entries[0]["timestamp"]).replace("Z", "+00:00"))
+                ended = datetime.fromisoformat(str(entries[-1]["timestamp"]).replace("Z", "+00:00"))
+                seconds = max(0, int((ended - started).total_seconds()))
+                minutes, seconds = divmod(seconds, 60)
+                hours, minutes = divmod(minutes, 60)
+                durations = f"{hours}h {minutes}m {seconds}s" if hours else f"{minutes}m {seconds}s"
+            except Exception:
+                durations = ""
+        return {
+            "project": str((incident or {}).get("project_name") or (incident or {}).get("project_id") or "").strip(),
+            "deployment_id": str((incident or {}).get("deployment_id") or "").strip(),
+            "automation_entries": len(entries),
+            "runs": len(run_ids),
+            "repair_attempts": len(attempts),
+            "commits": len(commit_events),
+            "pushes": len(push_events),
+            "handoffs": len(handoff_events),
+            "pending_approvals": len(pending_approvals),
+            "approved_approvals": int(((approval_queue.get("counts") or {}).get("approved")) or 0),
+            "rejected_approvals": int(((approval_queue.get("counts") or {}).get("rejected")) or 0),
+            "duration": durations,
+        }
+
+    def format_incident_metrics(self, metrics):
+        if not metrics:
+            return "No incident metrics yet."
+        lines = [
+            f"Project: {metrics.get('project') or 'unknown'}",
+            f"Deployment: {metrics.get('deployment_id') or 'unknown'}",
+            f"Automation entries: {metrics.get('automation_entries') or 0}",
+            f"Runs detected: {metrics.get('runs') or 0}",
+            f"Repair attempts: {metrics.get('repair_attempts') or 0}",
+            f"Commits: {metrics.get('commits') or 0}",
+            f"Pushes: {metrics.get('pushes') or 0}",
+            f"Handoffs: {metrics.get('handoffs') or 0}",
+            f"Pending approvals: {metrics.get('pending_approvals') or 0}",
+            f"Approved approvals: {metrics.get('approved_approvals') or 0}",
+            f"Rejected approvals: {metrics.get('rejected_approvals') or 0}",
+        ]
+        if metrics.get("duration"):
+            lines.append(f"Observed duration: {metrics['duration']}")
         return "\n".join(lines)
 
     def _detect_package_manager(self, root):
@@ -1432,15 +1859,11 @@ class TestDebugSystem:
             "push_results": push_results,
         }
 
-    def safe_commit_and_push(
+    def safe_commit_changes(
         self,
         repo_path,
         commit_message,
         on_event,
-        push_github=False,
-        push_gitlab=False,
-        github_token="",
-        gitlab_token="",
     ):
         root = Path(repo_path).expanduser()
         repo_state = self.inspect_repo_state(root)
@@ -1487,9 +1910,51 @@ class TestDebugSystem:
             return {"ok": False, "snapshot": snapshot, "repo_state": repo_state}
 
         branch = self._git.get_current_branch(str(root)) or "main"
+        final_repo_state = self.inspect_repo_state(root)
+        return {
+            "ok": True,
+            "snapshot": snapshot,
+            "repo_state": final_repo_state,
+            "commit_message": message,
+            "branch": branch,
+        }
+
+    def push_current_branch(
+        self,
+        repo_path,
+        on_event,
+        *,
+        push_github=False,
+        push_gitlab=False,
+        github_token="",
+        gitlab_token="",
+        push_policy=None,
+        initial_repo_state=None,
+    ):
+        root = Path(repo_path).expanduser()
+        repo_state = self.inspect_repo_state(root)
+        guard = self.evaluate_push_guard(
+            repo_state,
+            initial_repo_state=initial_repo_state,
+            push_github=push_github,
+            push_gitlab=push_gitlab,
+            policy=push_policy,
+        )
+        if not guard.get("ok"):
+            on_event({"type": "safe_push_guard_blocked", "message": guard.get("summary", "Push guard blocked.")})
+            for item in guard.get("issues") or []:
+                on_event({"type": "safe_push_guard_issue", "message": item})
+            return {
+                "ok": False,
+                "reason": "push_guard_blocked",
+                "guard": guard,
+                "repo_state": repo_state,
+                "push_results": [],
+            }
+
+        branch = self._git.get_current_branch(str(root)) or "main"
         push_results = []
         any_push_ok = False
-
         if push_github:
             env = {"GIT_ASKPASS": "echo", "GIT_USERNAME": "x-token", "GIT_PASSWORD": github_token} if github_token else None
             ok_push, out_push = self._git.push(str(root), "origin", branch, env=env)
@@ -1515,12 +1980,57 @@ class TestDebugSystem:
                 on_event({"type": "safe_push_failed", "message": "Push failed."})
 
         return {
-            "ok": ok_commit and (not push_results or any(item["ok"] for item in push_results)),
-            "snapshot": snapshot,
+            "ok": not push_results or any(item["ok"] for item in push_results),
+            "guard": guard,
             "repo_state": repo_state,
-            "commit_message": message,
             "branch": branch,
             "push_results": push_results,
+        }
+
+    def safe_commit_and_push(
+        self,
+        repo_path,
+        commit_message,
+        on_event,
+        push_github=False,
+        push_gitlab=False,
+        github_token="",
+        gitlab_token="",
+        push_policy=None,
+        initial_repo_state=None,
+    ):
+        commit_result = self.safe_commit_changes(
+            repo_path=repo_path,
+            commit_message=commit_message,
+            on_event=on_event,
+        )
+        if not commit_result.get("ok"):
+            return commit_result
+        if not (push_github or push_gitlab):
+            commit_result["push_results"] = []
+            return commit_result
+
+        push_result = self.push_current_branch(
+            repo_path=repo_path,
+            on_event=on_event,
+            push_github=push_github,
+            push_gitlab=push_gitlab,
+            github_token=github_token,
+            gitlab_token=gitlab_token,
+            push_policy=push_policy,
+            initial_repo_state=initial_repo_state or commit_result.get("repo_state"),
+        )
+        return {
+            "ok": bool(commit_result.get("ok") and push_result.get("ok")),
+            "snapshot": commit_result.get("snapshot"),
+            "repo_state": push_result.get("repo_state") or commit_result.get("repo_state"),
+            "commit_message": commit_result.get("commit_message"),
+            "branch": commit_result.get("branch"),
+            "push_results": push_result.get("push_results") or [],
+            "guard": push_result.get("guard"),
+            "commit_ok": True,
+            "push_ok": bool(push_result.get("ok")),
+            "reason": push_result.get("reason") or "",
         }
 
     def _run_streaming_command(self, repo_path, command, on_output, stop_event=None):
@@ -1723,6 +2233,12 @@ class TestDebugSystem:
             return ""
         return (result.stdout or "").strip()
 
+    def _git_capture(self, repo_path, command):
+        result = subprocess.run(command, cwd=str(repo_path), capture_output=True, text=True)
+        if result.returncode != 0:
+            return ""
+        return (result.stdout or "").strip()
+
     def _append_text(self, path, text):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with Path(path).open("a", encoding="utf-8") as handle:
@@ -1839,6 +2355,39 @@ class TestDebugSystem:
                 if message:
                     lines.append(f"  {message}")
 
+        return "\n".join(lines)
+
+    def format_approval_queue(self, queue):
+        items = queue.get("items") or []
+        if not items:
+            return "No approval requests recorded for this incident."
+
+        latest_pending = queue.get("latest_pending") or {}
+        counts = queue.get("counts") or {}
+        lines = [
+            f"Queue file: {queue.get('queue_file')}",
+            f"Pending: {counts.get('pending') or 0}",
+            f"Approved: {counts.get('approved') or 0}",
+            f"Rejected: {counts.get('rejected') or 0}",
+        ]
+        if latest_pending:
+            lines.extend(
+                [
+                    "",
+                    "Latest pending request:",
+                    f"- Action: {latest_pending.get('action') or 'unknown'}",
+                    f"- Message: {latest_pending.get('message') or 'No message'}",
+                    f"- Source: {latest_pending.get('source') or 'unknown'}",
+                ]
+            )
+
+        lines.extend(["", "Recent requests:"])
+        for item in items[-8:]:
+            lines.append(
+                f"{item.get('created_at') or 'unknown'} | {item.get('action') or 'unknown'} | {item.get('status') or 'pending'}"
+            )
+            if item.get("message"):
+                lines.append(f"  {item['message']}")
         return "\n".join(lines)
 
     def strip_log_tags(self, message):

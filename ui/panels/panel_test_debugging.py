@@ -38,14 +38,20 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._current_analysis = None
         self._current_plan = []
         self._current_automation_history = None
+        self._current_approval_queue = None
+        self._current_metrics = None
+        self._current_debug_context = None
         self._current_repair_history = None
         self._current_repo_state = None
+        self._current_push_guard = None
+        self._current_flow_start_state = None
         self._current_rollback_target = None
         self._current_gate_state = None
         self._run_thread = None
         self._stop_event = None
         self._repair_thread = None
         self._commit_thread = None
+        self._push_thread = None
         self._rollback_thread = None
         self._one_click_thread = None
         self._auto_ingest_job = None
@@ -180,6 +186,48 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._automation_box = LogBox(automation_card, height=150)
         self._automation_box.pack(fill="x", padx=PAD, pady=(0, PAD_SM))
 
+        approval_card = Card(scroll)
+        approval_card.pack(fill="x", pady=(0, PAD_SM))
+        approval_header = ctk.CTkFrame(approval_card, fg_color="transparent")
+        approval_header.pack(fill="x", padx=PAD, pady=(PAD_SM, 6))
+        Label(approval_header, text="Approval Queue", size=13, bold=True).pack(side="left")
+        self._approval_badge = StatusBadge(approval_header, status="pending", text="No pending approvals")
+        self._approval_badge.pack(side="right", padx=(8, 0))
+        SecondaryButton(
+            approval_header, text="Refresh Queue", width=120, height=32, command=self._refresh_approval_queue
+        ).pack(side="right")
+        self._approval_box = LogBox(approval_card, height=140)
+        self._approval_box.pack(fill="x", padx=PAD, pady=(0, 8))
+        approval_btn_row = ctk.CTkFrame(approval_card, fg_color="transparent")
+        approval_btn_row.pack(fill="x", padx=PAD, pady=(0, PAD_SM))
+        self._approve_repair_btn = SecondaryButton(
+            approval_btn_row, text="Approve Repair", width=130, height=34, command=lambda: self._handle_approval("repair", True)
+        )
+        self._approve_repair_btn.pack(side="left", padx=(0, 8))
+        self._approve_commit_btn = SecondaryButton(
+            approval_btn_row, text="Approve Commit", width=130, height=34, command=lambda: self._handle_approval("commit", True)
+        )
+        self._approve_commit_btn.pack(side="left", padx=(0, 8))
+        self._approve_push_btn = PrimaryButton(
+            approval_btn_row, text="Approve Push", width=120, height=34, command=lambda: self._handle_approval("push", True)
+        )
+        self._approve_push_btn.pack(side="left", padx=(0, 8))
+        self._reject_approval_btn = SecondaryButton(
+            approval_btn_row, text="Reject Latest", width=120, height=34, command=lambda: self._handle_approval("", False)
+        )
+        self._reject_approval_btn.pack(side="left")
+
+        metrics_card = Card(scroll)
+        metrics_card.pack(fill="x", pady=(0, PAD_SM))
+        metrics_header = ctk.CTkFrame(metrics_card, fg_color="transparent")
+        metrics_header.pack(fill="x", padx=PAD, pady=(PAD_SM, 6))
+        Label(metrics_header, text="Run Metrics", size=13, bold=True).pack(side="left")
+        SecondaryButton(
+            metrics_header, text="Refresh Metrics", width=120, height=32, command=self._refresh_metrics
+        ).pack(side="right")
+        self._metrics_box = LogBox(metrics_card, height=120)
+        self._metrics_box.pack(fill="x", padx=PAD, pady=(0, PAD_SM))
+
         repo_card = Card(scroll)
         repo_card.pack(fill="x", pady=(0, PAD_SM))
         SectionHeader(repo_card, "R", "Repository Resolver", "").pack(
@@ -294,6 +342,42 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._approval_mode_hint = Label(repair_card, text="", size=11, color=TEXT_DIM)
         self._approval_mode_hint.pack(anchor="w", padx=PAD, pady=(0, 8))
 
+        approval_gate_row = ctk.CTkFrame(repair_card, fg_color="transparent")
+        approval_gate_row.pack(fill="x", padx=PAD, pady=(0, 8))
+        self._require_repair_approval_var = ctk.BooleanVar(value=False)
+        self._require_commit_approval_var = ctk.BooleanVar(value=False)
+        self._require_push_approval_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            approval_gate_row,
+            text="Queue repair approval",
+            variable=self._require_repair_approval_var,
+            fg_color=PRIMARY,
+            hover_color=PRIMARY_H,
+            text_color=TEXT,
+            font=ctk.CTkFont(family="Inter", size=12),
+            command=self._save_repair_settings,
+        ).pack(side="left", padx=(0, PAD_SM))
+        ctk.CTkCheckBox(
+            approval_gate_row,
+            text="Queue commit approval",
+            variable=self._require_commit_approval_var,
+            fg_color=PRIMARY,
+            hover_color=PRIMARY_H,
+            text_color=TEXT,
+            font=ctk.CTkFont(family="Inter", size=12),
+            command=self._save_repair_settings,
+        ).pack(side="left", padx=(0, PAD_SM))
+        ctk.CTkCheckBox(
+            approval_gate_row,
+            text="Queue push approval",
+            variable=self._require_push_approval_var,
+            fg_color=PRIMARY,
+            hover_color=PRIMARY_H,
+            text_color=TEXT,
+            font=ctk.CTkFont(family="Inter", size=12),
+            command=self._save_repair_settings,
+        ).pack(side="left")
+
         repair_cmd_row = ctk.CTkFrame(repair_card, fg_color="transparent")
         repair_cmd_row.pack(fill="x", padx=PAD, pady=(0, 8))
         self._repair_cmd_var = ctk.StringVar()
@@ -380,6 +464,17 @@ class PanelTestDebugging(ctk.CTkFrame):
         )
         self._open_latest_command_log_btn.pack(side="left")
 
+        debug_card = Card(scroll)
+        debug_card.pack(fill="x", pady=(0, PAD_SM))
+        debug_header = ctk.CTkFrame(debug_card, fg_color="transparent")
+        debug_header.pack(fill="x", padx=PAD, pady=(PAD_SM, 6))
+        Label(debug_header, text="Debug Context", size=13, bold=True).pack(side="left")
+        SecondaryButton(
+            debug_header, text="Refresh Context", width=130, height=32, command=self._refresh_debug_context
+        ).pack(side="right")
+        self._debug_context_box = LogBox(debug_card, height=170)
+        self._debug_context_box.pack(fill="x", padx=PAD, pady=(0, PAD_SM))
+
         gate_card = Card(scroll)
         gate_card.pack(fill="x", pady=(0, PAD_SM))
         gate_header = ctk.CTkFrame(gate_card, fg_color="transparent")
@@ -435,6 +530,7 @@ class PanelTestDebugging(ctk.CTkFrame):
             hover_color=PRIMARY_H,
             text_color=TEXT,
             font=ctk.CTkFont(family="Inter", size=12),
+            command=self._refresh_repo_state,
         ).pack(side="left", padx=(0, PAD_SM))
         ctk.CTkCheckBox(
             commit_opts_row,
@@ -444,6 +540,66 @@ class PanelTestDebugging(ctk.CTkFrame):
             hover_color=PRIMARY_H,
             text_color=TEXT,
             font=ctk.CTkFont(family="Inter", size=12),
+            command=self._refresh_repo_state,
+        ).pack(side="left")
+
+        push_guard_row = ctk.CTkFrame(commit_card, fg_color="transparent")
+        push_guard_row.pack(fill="x", padx=PAD, pady=(0, 8))
+        self._allow_auto_push_var = ctk.BooleanVar(value=False)
+        self._require_clean_start_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            push_guard_row,
+            text="Allow auto-push for this repo",
+            variable=self._allow_auto_push_var,
+            fg_color=PRIMARY,
+            hover_color=PRIMARY_H,
+            text_color=TEXT,
+            font=ctk.CTkFont(family="Inter", size=12),
+            command=self._save_push_guard_settings,
+        ).pack(side="left", padx=(0, PAD_SM))
+        ctk.CTkCheckBox(
+            push_guard_row,
+            text="Require clean repo at flow start",
+            variable=self._require_clean_start_var,
+            fg_color=PRIMARY,
+            hover_color=PRIMARY_H,
+            text_color=TEXT,
+            font=ctk.CTkFont(family="Inter", size=12),
+            command=self._save_push_guard_settings,
+        ).pack(side="left")
+
+        push_guard_entry_row = ctk.CTkFrame(commit_card, fg_color="transparent")
+        push_guard_entry_row.pack(fill="x", padx=PAD, pady=(0, 8))
+        Label(push_guard_entry_row, text="Allowed branches:", size=12, color=TEXT_DIM).pack(side="left", padx=(0, 8))
+        self._allowed_branches_var = ctk.StringVar()
+        self._allowed_branches_entry = ctk.CTkEntry(
+            push_guard_entry_row,
+            textvariable=self._allowed_branches_var,
+            width=240,
+            fg_color=BG3,
+            border_color=BORDER,
+            text_color=TEXT,
+            corner_radius=8,
+            height=34,
+            font=ctk.CTkFont(family="Inter", size=12),
+        )
+        self._allowed_branches_entry.pack(side="left", padx=(0, 8))
+        Label(push_guard_entry_row, text="Allowed remotes:", size=12, color=TEXT_DIM).pack(side="left", padx=(0, 8))
+        self._allowed_remotes_var = ctk.StringVar()
+        self._allowed_remotes_entry = ctk.CTkEntry(
+            push_guard_entry_row,
+            textvariable=self._allowed_remotes_var,
+            width=220,
+            fg_color=BG3,
+            border_color=BORDER,
+            text_color=TEXT,
+            corner_radius=8,
+            height=34,
+            font=ctk.CTkFont(family="Inter", size=12),
+        )
+        self._allowed_remotes_entry.pack(side="left", padx=(0, 8))
+        SecondaryButton(
+            push_guard_entry_row, text="Save Guard", width=100, height=34, command=self._save_push_guard_settings
         ).pack(side="left")
 
         commit_btn_row = ctk.CTkFrame(commit_card, fg_color="transparent")
@@ -458,6 +614,11 @@ class PanelTestDebugging(ctk.CTkFrame):
             command=lambda: self._start_safe_commit(push=True)
         )
         self._commit_push_btn.pack(side="left")
+        self._push_only_btn = SecondaryButton(
+            commit_btn_row, text="Push Current Commit", width=150, height=36, state="disabled",
+            command=self._start_push_only
+        )
+        self._push_only_btn.pack(side="left", padx=(8, 0))
 
         rollback_btn_row = ctk.CTkFrame(commit_card, fg_color="transparent")
         rollback_btn_row.pack(fill="x", padx=PAD, pady=(0, PAD_SM))
@@ -488,8 +649,16 @@ class PanelTestDebugging(ctk.CTkFrame):
             repair_command = self._system.default_repair_command_template()
         self._repair_cmd_var.set(repair_command)
         self._repair_attempts_var.set(str(self.cfg.get("test_debugging_repair_attempts", "2")))
+        self._require_repair_approval_var.set(bool(self.cfg.get("test_debugging_require_repair_approval", False)))
+        self._require_commit_approval_var.set(bool(self.cfg.get("test_debugging_require_commit_approval", False)))
+        self._require_push_approval_var.set(bool(self.cfg.get("test_debugging_require_push_approval", True)))
         self._auto_ingest_var.set(bool(self.cfg.get("test_debugging_auto_ingest", True)))
         self._auto_run_var.set(bool(self.cfg.get("test_debugging_auto_run", False)))
+        push_policy = self._system.normalize_push_policy(self.cfg.get("test_debugging_push_policy", {}))
+        self._allow_auto_push_var.set(bool(push_policy.get("allow_auto_push")))
+        self._require_clean_start_var.set(bool(push_policy.get("require_clean_start")))
+        self._allowed_branches_var.set(", ".join(push_policy.get("allowed_branches") or []))
+        self._allowed_remotes_var.set(", ".join(push_policy.get("allowed_remotes") or []))
         approval_mode = self._system.get_approval_mode(
             self.cfg.get("test_debugging_approval_mode", self._system.default_approval_mode())
         )
@@ -497,15 +666,20 @@ class PanelTestDebugging(ctk.CTkFrame):
             self._approval_mode_key_to_label.get(approval_mode["key"], approval_mode["label"])
         )
         self._replace_logbox(self._automation_box, "No automation activity recorded yet for this incident.")
+        self._replace_logbox(self._approval_box, "No approval requests recorded for this incident.")
+        self._replace_logbox(self._metrics_box, "No incident metrics yet.")
         self._replace_logbox(self._repair_artifacts_box, "Select an incident to inspect repair artifacts.")
+        self._replace_logbox(self._debug_context_box, "No debug context available yet.")
         self._replace_logbox(self._gate_box, "Run validation to evaluate required checks.")
         self._replace_logbox(self._repo_state_box, "Select and analyze a repository to inspect git state.")
         self._automation_badge.update_status("pending", "No automation activity")
+        self._approval_badge.update_status("pending", "No pending approvals")
         self._apply_approval_mode_ui(approval_mode)
         self._update_repair_artifact_buttons()
         self._reset_safety_gate()
         self._update_commit_buttons()
         self._update_rollback_buttons()
+        self._update_approval_buttons()
 
     # ---------- Incident inbox ----------
 
@@ -717,8 +891,13 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._current_analysis = None
         self._current_plan = []
         self._current_automation_history = None
+        self._current_approval_queue = None
+        self._current_metrics = None
+        self._current_debug_context = None
         self._current_repair_history = None
         self._current_repo_state = None
+        self._current_push_guard = None
+        self._current_flow_start_state = None
         self._current_rollback_target = None
         self._reset_safety_gate()
 
@@ -760,8 +939,11 @@ class PanelTestDebugging(ctk.CTkFrame):
             repair_command = self._system.default_repair_command_template()
         self._repair_cmd_var.set(repair_command)
         self._refresh_automation_history()
+        self._refresh_approval_queue()
         self._refresh_repair_history()
         self._refresh_repo_state()
+        self._refresh_debug_context()
+        self._refresh_metrics()
         self._badge.update_status("info", f"Incident selected: {self._short_id(incident.get('deployment_id'))}")
 
     def _resolve_repo_mapping(self, incident):
@@ -815,11 +997,38 @@ class PanelTestDebugging(ctk.CTkFrame):
     def _save_repair_settings(self):
         self.cfg.set("test_debugging_repair_command", self._repair_cmd_var.get().strip())
         self.cfg.set("test_debugging_repair_attempts", self._repair_attempts_var.get().strip() or "2")
+        self.cfg.set("test_debugging_require_repair_approval", bool(self._require_repair_approval_var.get()))
+        self.cfg.set("test_debugging_require_commit_approval", bool(self._require_commit_approval_var.get()))
+        self.cfg.set("test_debugging_require_push_approval", bool(self._require_push_approval_var.get()))
         self._badge.update_status("ok", "Repair loop settings saved")
 
     def _reset_default_repair_command(self):
         self._repair_cmd_var.set(self._system.default_repair_command_template())
         self._badge.update_status("info", "Default Codex repair command restored")
+
+    def _selected_push_policy(self, source="manual"):
+        return self._system.normalize_push_policy(
+            {
+                "allow_auto_push": bool(self._allow_auto_push_var.get()),
+                "allowed_branches": self._allowed_branches_var.get().strip(),
+                "allowed_remotes": self._allowed_remotes_var.get().strip(),
+                "require_clean_start": bool(self._require_clean_start_var.get()),
+                "source": source,
+            }
+        )
+
+    def _save_push_guard_settings(self):
+        self.cfg.set(
+            "test_debugging_push_policy",
+            {
+                "allow_auto_push": bool(self._allow_auto_push_var.get()),
+                "allowed_branches": self._allowed_branches_var.get().strip(),
+                "allowed_remotes": self._allowed_remotes_var.get().strip(),
+                "require_clean_start": bool(self._require_clean_start_var.get()),
+            },
+        )
+        self._refresh_repo_state()
+        self._badge.update_status("ok", "Push guard settings saved")
 
     # ---------- Analyze / run ----------
 
@@ -869,6 +1078,8 @@ class PanelTestDebugging(ctk.CTkFrame):
             return
 
         approval_mode = self._selected_approval_mode()
+        initial_repo_state = self._system.inspect_repo_state(repo_path)
+        self._current_flow_start_state = initial_repo_state
         flow_run_id = str(run_id or "").strip() or self._system.new_automation_run_id(source)
         push_targets = {
             "github": bool(self._push_github_var.get()),
@@ -903,6 +1114,8 @@ class PanelTestDebugging(ctk.CTkFrame):
                 self._stop_event,
                 dict(approval_mode),
                 dict(push_targets),
+                dict(initial_repo_state or {}),
+                self._selected_push_policy(source=source),
                 str(source or "manual"),
                 flow_run_id,
             ),
@@ -910,11 +1123,12 @@ class PanelTestDebugging(ctk.CTkFrame):
         )
         self._one_click_thread.start()
 
-    def _one_click_flow_worker(self, repo_path, incident, stop_event, approval_mode, push_targets, source, run_id):
+    def _one_click_flow_worker(self, repo_path, incident, stop_event, approval_mode, push_targets, initial_repo_state, push_policy, source, run_id):
         analysis = self._system.analyze_repository(repo_path)
         plan = analysis.get("plan") or []
         repair_result = None
         commit_result = None
+        push_result = None
         commit_warning = ""
 
         def _apply_analysis():
@@ -953,32 +1167,79 @@ class PanelTestDebugging(ctk.CTkFrame):
                 self.after(0, lambda text=msg: self._run_log.append(text))
 
         if approval_mode.get("auto_repair"):
-            repair_result = self._system.start_repair_loop(
-                repo_path=repo_path,
-                incident=incident,
-                analysis=analysis,
-                plan=plan,
-                on_event=on_event,
-                stop_event=stop_event,
-                max_attempts=int(self._repair_attempts_var.get() or "2"),
-                repair_command_template=self._repair_cmd_var.get().strip(),
-            )
+            if self._require_repair_approval_var.get():
+                approval = self._system.enqueue_approval_request(
+                    incident,
+                    action="repair",
+                    message="Repair step is waiting for approval.",
+                    run_id=run_id,
+                    source=source,
+                    metadata={"approval_mode": approval_mode, "push_targets": push_targets},
+                )
+                on_event({"type": "approval_queue", "message": "Repair approval queued."})
+                repair_result = {"ok": False, "approval_pending": True, "approval": approval}
+            else:
+                repair_result = self._system.start_repair_loop(
+                    repo_path=repo_path,
+                    incident=incident,
+                    analysis=analysis,
+                    plan=plan,
+                    on_event=on_event,
+                    stop_event=stop_event,
+                    max_attempts=int(self._repair_attempts_var.get() or "2"),
+                    repair_command_template=self._repair_cmd_var.get().strip(),
+                )
 
             if repair_result.get("ok") and approval_mode.get("auto_commit"):
                 repair_history = self._system.inspect_repair_history(incident)
                 commit_message = self._system.build_commit_message(incident, repair_history or {})
-                if approval_mode.get("auto_push") and not any(push_targets.values()):
-                    commit_warning = "Push mode selected, but no remotes are enabled. Commit will stay local."
-                    on_event({"type": "approval_push_warning", "message": commit_warning})
-                commit_result = self._system.safe_commit_and_push(
-                    repo_path=repo_path,
-                    commit_message=commit_message,
-                    on_event=on_event,
-                    push_github=bool(approval_mode.get("auto_push") and push_targets.get("github")),
-                    push_gitlab=bool(approval_mode.get("auto_push") and push_targets.get("gitlab")),
-                    github_token=self.app_state.get("github_token") or self.cfg.get_github_token(),
-                    gitlab_token=self.app_state.get("gitlab_token") or self.cfg.get_gitlab_token(),
-                )
+                if self._require_commit_approval_var.get():
+                    approval = self._system.enqueue_approval_request(
+                        incident,
+                        action="commit",
+                        message="Commit step is waiting for approval.",
+                        run_id=run_id,
+                        source=source,
+                        metadata={"approval_mode": approval_mode, "push_targets": push_targets},
+                    )
+                    on_event({"type": "approval_queue", "message": "Commit approval queued."})
+                    commit_result = {"ok": False, "approval_pending": True, "approval": approval}
+                else:
+                    commit_result = self._system.safe_commit_changes(
+                        repo_path=repo_path,
+                        commit_message=commit_message,
+                        on_event=on_event,
+                    )
+                    if approval_mode.get("auto_push") and not any(push_targets.values()):
+                        commit_warning = "Push mode selected, but no remotes are enabled. Commit will stay local."
+                        on_event({"type": "approval_push_warning", "message": commit_warning})
+                    elif commit_result.get("ok") and approval_mode.get("auto_push"):
+                        if self._require_push_approval_var.get():
+                            approval = self._system.enqueue_approval_request(
+                                incident,
+                                action="push",
+                                message="Push step is waiting for approval.",
+                                run_id=run_id,
+                                source=source,
+                                metadata={
+                                    "approval_mode": approval_mode,
+                                    "push_targets": push_targets,
+                                    "initial_repo_state": initial_repo_state,
+                                },
+                            )
+                            on_event({"type": "approval_queue", "message": "Push approval queued."})
+                            push_result = {"ok": False, "approval_pending": True, "approval": approval}
+                        else:
+                            push_result = self._system.push_current_branch(
+                                repo_path=repo_path,
+                                on_event=on_event,
+                                push_github=bool(push_targets.get("github")),
+                                push_gitlab=bool(push_targets.get("gitlab")),
+                                github_token=self.app_state.get("github_token") or self.cfg.get_github_token(),
+                                gitlab_token=self.app_state.get("gitlab_token") or self.cfg.get_gitlab_token(),
+                                push_policy=push_policy,
+                                initial_repo_state=initial_repo_state,
+                            )
 
         def _finish():
             self._run_btn.configure(state="normal")
@@ -997,13 +1258,33 @@ class PanelTestDebugging(ctk.CTkFrame):
                 automation_event = "flow_ready"
                 automation_message = f"{approval_mode['label']} analysis completed."
                 self._badge.update_status("ok", f"{approval_mode['label']} ready")
+            elif repair_result.get("approval_pending"):
+                automation_status = "warning"
+                automation_event = "approval_pending_repair"
+                automation_message = "Repair approval is pending."
+                self._badge.update_status("warning", "Repair approval pending")
             elif repair_result.get("ok") and approval_mode.get("auto_commit"):
-                if commit_result and commit_result.get("ok"):
-                    if approval_mode.get("auto_push") and any(push_targets.values()):
+                if commit_result and commit_result.get("approval_pending"):
+                    automation_status = "warning"
+                    automation_event = "approval_pending_commit"
+                    automation_message = "Commit approval is pending."
+                    self._badge.update_status("warning", "Commit approval pending")
+                elif commit_result and commit_result.get("ok"):
+                    if push_result and push_result.get("approval_pending"):
+                        automation_status = "warning"
+                        automation_event = "approval_pending_push"
+                        automation_message = "Push approval is pending."
+                        self._badge.update_status("warning", "Push approval pending")
+                    elif approval_mode.get("auto_push") and any(push_targets.values()) and push_result and push_result.get("ok"):
                         automation_status = "ok"
                         automation_event = "flow_pushed"
                         automation_message = "Repair reached green and was pushed successfully."
                         self._badge.update_status("ok", "Repair + Push completed")
+                    elif approval_mode.get("auto_push") and any(push_targets.values()) and push_result and push_result.get("reason") == "push_guard_blocked":
+                        automation_status = "warning"
+                        automation_event = "flow_push_guard_blocked"
+                        automation_message = "Push guard blocked the automated push."
+                        self._badge.update_status("warning", "Push guard blocked the automated push")
                     elif approval_mode.get("auto_push"):
                         automation_status = "warning"
                         automation_event = "flow_commit_local_only"
@@ -1049,8 +1330,13 @@ class PanelTestDebugging(ctk.CTkFrame):
                     "handoff_ready": bool((repair_result or {}).get("handoff_ready")),
                     "commit_ok": bool((commit_result or {}).get("ok")),
                     "commit_reason": (commit_result or {}).get("reason") or "",
+                    "push_ok": bool((push_result or {}).get("ok")),
+                    "push_reason": (push_result or {}).get("reason") or "",
                 },
             )
+            self._refresh_approval_queue()
+            self._refresh_debug_context()
+            self._refresh_metrics()
 
         self.after(0, _finish)
 
@@ -1218,6 +1504,8 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._update_repair_artifact_buttons()
         self._update_rollback_buttons()
         self._suggest_commit_message(force=False)
+        self._refresh_debug_context()
+        self._refresh_metrics()
 
     def _refresh_automation_history(self):
         if not self._current_incident:
@@ -1233,6 +1521,51 @@ class PanelTestDebugging(ctk.CTkFrame):
             history.get("badge_status") or "pending",
             history.get("badge_text") or "No automation activity",
         )
+
+    def _refresh_approval_queue(self):
+        if not self._current_incident:
+            self._current_approval_queue = None
+            self._replace_logbox(self._approval_box, "No approval requests recorded for this incident.")
+            self._approval_badge.update_status("pending", "No pending approvals")
+            self._update_approval_buttons()
+            return
+
+        queue = self._system.inspect_approval_queue(self._current_incident)
+        self._current_approval_queue = queue
+        self._replace_logbox(self._approval_box, self._system.format_approval_queue(queue))
+        latest_pending = queue.get("latest_pending") or {}
+        if latest_pending:
+            self._approval_badge.update_status("warning", f"Pending {latest_pending.get('action') or 'approval'}")
+        else:
+            self._approval_badge.update_status("ok", "Approval queue clear")
+        self._update_approval_buttons()
+
+    def _refresh_metrics(self):
+        if not self._current_incident:
+            self._current_metrics = None
+            self._replace_logbox(self._metrics_box, "No incident metrics yet.")
+            return
+        metrics = self._system.build_incident_metrics(
+            self._current_incident,
+            automation_history=self._current_automation_history or {},
+            repair_history=self._current_repair_history or {},
+            approval_queue=self._current_approval_queue or {},
+        )
+        self._current_metrics = metrics
+        self._replace_logbox(self._metrics_box, self._system.format_incident_metrics(metrics))
+
+    def _refresh_debug_context(self):
+        if not self._current_incident:
+            self._current_debug_context = None
+            self._replace_logbox(self._debug_context_box, "No debug context available yet.")
+            return
+        context = self._system.build_debug_context(
+            self._current_incident,
+            self._current_repair_history or {},
+            self._current_repo_state or {},
+        )
+        self._current_debug_context = context
+        self._replace_logbox(self._debug_context_box, self._system.format_debug_context(context))
 
     def _reset_safety_gate(self):
         gate = self._system.build_safety_gate(self._current_plan, results=[], run_ok=False, executed=False)
@@ -1284,11 +1617,20 @@ class PanelTestDebugging(ctk.CTkFrame):
 
         repo_state = self._system.inspect_repo_state(repo_path)
         self._current_repo_state = repo_state
+        self._current_push_guard = self._system.evaluate_push_guard(
+            repo_state,
+            initial_repo_state=self._current_flow_start_state or {},
+            push_github=bool(self._push_github_var.get()),
+            push_gitlab=bool(self._push_gitlab_var.get()),
+            policy=self._selected_push_policy(source="manual"),
+        )
         self._current_rollback_target = self._system.resolve_rollback_snapshot(
             repo_path,
             self._current_repair_history or {},
         )
         repo_state_text = self._system.format_repo_state(repo_state)
+        if self._current_push_guard:
+            repo_state_text += "\n\nPush guard:\n" + self._system.format_push_guard(self._current_push_guard)
         if (self._current_rollback_target or {}).get("ok"):
             repo_state_text += (
                 "\n\nRollback target:\n"
@@ -1299,6 +1641,7 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._suggest_commit_message(force=force_message)
         self._update_commit_buttons()
         self._update_rollback_buttons()
+        self._refresh_debug_context()
 
     def _suggest_commit_message(self, force=False):
         if not self._current_incident:
@@ -1314,20 +1657,35 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._commit_msg_var.set(suggestion)
 
     def _update_commit_buttons(self):
-        enabled = bool(
+        commit_enabled = bool(
             (self._current_repo_state or {}).get("ok")
             and (self._current_repo_state or {}).get("dirty")
             and (self._current_gate_state or {}).get("ok")
         )
-        state = "normal" if enabled else "disabled"
-        self._commit_btn.configure(state=state)
-        self._commit_push_btn.configure(state=state)
+        push_guard_ok = bool((self._current_push_guard or {}).get("ok"))
+        push_enabled = bool(
+            (self._current_repo_state or {}).get("ok")
+            and not (self._current_repo_state or {}).get("dirty")
+            and push_guard_ok
+            and (self._push_github_var.get() or self._push_gitlab_var.get())
+        )
+        self._commit_btn.configure(state="normal" if commit_enabled else "disabled")
+        self._commit_push_btn.configure(state="normal" if (commit_enabled and push_guard_ok) else "disabled")
+        self._push_only_btn.configure(state="normal" if push_enabled else "disabled")
 
     def _update_rollback_buttons(self):
         enabled = bool((self._current_rollback_target or {}).get("ok"))
         state = "normal" if enabled else "disabled"
         self._rollback_btn.configure(state=state)
         self._rollback_push_btn.configure(state=state)
+
+    def _update_approval_buttons(self):
+        pending = (self._current_approval_queue or {}).get("pending_items") or []
+        action_states = {item.get("action"): item for item in pending}
+        self._approve_repair_btn.configure(state="normal" if action_states.get("repair") else "disabled")
+        self._approve_commit_btn.configure(state="normal" if action_states.get("commit") else "disabled")
+        self._approve_push_btn.configure(state="normal" if action_states.get("push") else "disabled")
+        self._reject_approval_btn.configure(state="normal" if pending else "disabled")
 
     def _start_safe_commit(self, push=False):
         if self._commit_thread and self._commit_thread.is_alive():
@@ -1375,6 +1733,8 @@ class PanelTestDebugging(ctk.CTkFrame):
             push_gitlab=bool(push and self._push_gitlab_var.get()),
             github_token=github_token,
             gitlab_token=gitlab_token,
+            push_policy=self._selected_push_policy(source="manual"),
+            initial_repo_state=self._current_flow_start_state or self._current_repo_state or {},
         )
 
         def _finish():
@@ -1382,7 +1742,14 @@ class PanelTestDebugging(ctk.CTkFrame):
             self._analyze_btn.configure(state="normal")
             self._one_click_btn.configure(state="normal")
             self._refresh_repo_state()
+            self._refresh_metrics()
             if result.get("ok"):
+                self._record_automation_event(
+                    source="manual",
+                    event="manual_commit_push" if push else "manual_commit",
+                    status="ok",
+                    message="Manual safe commit flow completed.",
+                )
                 self._badge.update_status("ok", "Safe commit flow completed")
             elif result.get("reason") == "clean":
                 self._badge.update_status("warning", "No changes to commit")
@@ -1390,6 +1757,113 @@ class PanelTestDebugging(ctk.CTkFrame):
                 self._badge.update_status("warning", "Safe commit flow finished with issues")
 
         self.after(0, _finish)
+
+    def _start_push_only(self):
+        if self._push_thread and self._push_thread.is_alive():
+            return
+        repo_path = self._repo_path_var.get().strip()
+        if not repo_path:
+            self._badge.update_status("error", "Select or map a repository first")
+            return
+        if not (self._current_push_guard or {}).get("ok"):
+            self._badge.update_status("warning", "Push guard is blocking the push")
+            return
+        self._run_log.clear()
+        self._run_btn.configure(state="disabled")
+        self._analyze_btn.configure(state="disabled")
+        self._one_click_btn.configure(state="disabled")
+        self._commit_btn.configure(state="disabled")
+        self._commit_push_btn.configure(state="disabled")
+        self._push_only_btn.configure(state="disabled")
+        self._badge.update_status("pending", "Pushing current commit")
+        self._push_thread = threading.Thread(target=self._push_only_worker, args=(repo_path,), daemon=True)
+        self._push_thread.start()
+
+    def _push_only_worker(self, repo_path):
+        github_token = self.app_state.get("github_token") or self.cfg.get_github_token()
+        gitlab_token = self.app_state.get("gitlab_token") or self.cfg.get_gitlab_token()
+
+        def on_event(event):
+            msg = str(event.get("message") or "").rstrip()
+            if msg:
+                self.after(0, lambda text=msg: self._run_log.append(text))
+
+        result = self._system.push_current_branch(
+            repo_path=repo_path,
+            on_event=on_event,
+            push_github=bool(self._push_github_var.get()),
+            push_gitlab=bool(self._push_gitlab_var.get()),
+            github_token=github_token,
+            gitlab_token=gitlab_token,
+            push_policy=self._selected_push_policy(source="manual"),
+            initial_repo_state=self._current_flow_start_state or self._current_repo_state or {},
+        )
+
+        def _finish():
+            self._run_btn.configure(state="normal")
+            self._analyze_btn.configure(state="normal")
+            self._one_click_btn.configure(state="normal")
+            self._refresh_repo_state()
+            self._refresh_metrics()
+            if result.get("ok"):
+                self._record_automation_event(
+                    source="manual",
+                    event="manual_push",
+                    status="ok",
+                    message="Manual push completed.",
+                )
+                self._badge.update_status("ok", "Push completed")
+            else:
+                self._badge.update_status("warning", "Push finished with issues")
+
+        self.after(0, _finish)
+
+    def _handle_approval(self, action, approved):
+        if not self._current_incident:
+            self._badge.update_status("error", "Select an incident first")
+            return
+        decision = "approved" if approved else "rejected"
+        resolved = self._system.resolve_approval_request(
+            self._current_incident,
+            action=str(action or "").strip(),
+            decision=decision,
+        )
+        if not resolved.get("ok"):
+            self._badge.update_status("warning", resolved.get("reason", "No pending approval found"))
+            return
+
+        item = resolved.get("item") or {}
+        self._refresh_approval_queue()
+        self._refresh_metrics()
+        self._record_automation_event(
+            source="manual",
+            run_id=item.get("run_id") or "",
+            event=f"approval_{decision}",
+            status="ok" if approved else "warning",
+            message=f"{(item.get('action') or 'approval').capitalize()} {decision}.",
+        )
+        if not approved:
+            self._badge.update_status("warning", "Approval request rejected")
+            return
+
+        action_name = str(item.get("action") or "").strip()
+        if action_name == "repair":
+            self._badge.update_status("pending", "Repair approval granted")
+            self._start_repair_loop()
+        elif action_name == "commit":
+            self._badge.update_status("pending", "Commit approval granted")
+            self._start_safe_commit(push=False)
+        elif action_name == "push":
+            metadata = item.get("metadata") or {}
+            initial_repo_state = metadata.get("initial_repo_state") or {}
+            if initial_repo_state:
+                self._current_flow_start_state = initial_repo_state
+            targets = metadata.get("push_targets") or {}
+            self._push_github_var.set(bool(targets.get("github", self._push_github_var.get())))
+            self._push_gitlab_var.set(bool(targets.get("gitlab", self._push_gitlab_var.get())))
+            self._refresh_repo_state()
+            self._badge.update_status("pending", "Push approval granted")
+            self._start_push_only()
 
     def _start_rollback(self, push=False):
         if self._rollback_thread and self._rollback_thread.is_alive():
@@ -1473,6 +1947,7 @@ class PanelTestDebugging(ctk.CTkFrame):
             self._run_thread,
             self._repair_thread,
             self._commit_thread,
+            self._push_thread,
             self._rollback_thread,
             self._one_click_thread,
         ]
@@ -1519,3 +1994,4 @@ class PanelTestDebugging(ctk.CTkFrame):
         )
         if self.winfo_exists():
             self.after(0, self._refresh_automation_history)
+            self.after(0, self._refresh_metrics)
