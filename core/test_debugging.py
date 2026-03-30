@@ -162,11 +162,87 @@ class TestDebugSystem:
         matches = sorted(deployment_dir.glob(f"*{suffix}"), key=lambda path: path.stat().st_mtime, reverse=True)
         return matches[0] if matches else None
 
+    def inspect_repair_history(self, incident):
+        deployment_dir = Path(incident.get("deployment_dir") or "").expanduser()
+        repair_dir = deployment_dir / "repair-loop"
+        if not repair_dir.exists():
+            return {
+                "ok": False,
+                "repair_dir": str(repair_dir),
+                "attempts": [],
+                "latest_attempt": None,
+            }
+
+        attempts = []
+        for context_path in sorted(repair_dir.glob("attempt-*-context.json")):
+            context = self._read_json(context_path)
+            if not isinstance(context, dict):
+                continue
+            stem = context_path.stem.replace("-context", "")
+            attempt = self._extract_attempt_number(stem, fallback=len(attempts) + 1)
+            brief_file = repair_dir / f"{stem}-brief.md"
+            output_file = repair_dir / f"{stem}-failed-output.log"
+            command_log_file = repair_dir / f"{stem}-repair-command.log"
+            prompt_file = repair_dir / f"{stem}-codex-prompt.md"
+            last_message_file = repair_dir / f"{stem}-codex-last-message.md"
+            failed_step = ((context.get("failedStep") or {}).get("step")) or {}
+            diagnosis = context.get("diagnosis") or {}
+            ai_summary = self._read_text_excerpt(last_message_file, max_lines=20, max_chars=2200, tail=False)
+            attempts.append(
+                {
+                    "attempt": attempt,
+                    "context_file": str(context_path),
+                    "brief_file": str(brief_file) if brief_file.exists() else "",
+                    "output_file": str(output_file) if output_file.exists() else "",
+                    "command_log_file": str(command_log_file) if command_log_file.exists() else "",
+                    "prompt_file": str(prompt_file) if prompt_file.exists() else "",
+                    "last_message_file": str(last_message_file) if last_message_file.exists() else "",
+                    "failed_step_name": str(failed_step.get("name") or "").strip(),
+                    "failed_step_command": str(failed_step.get("command") or "").strip(),
+                    "diagnosis_category": str(diagnosis.get("category") or "").strip(),
+                    "diagnosis_hint": str(diagnosis.get("hint") or "").strip(),
+                    "snapshot_branch": str(((context.get("snapshot") or {}).get("branch")) or "").strip(),
+                    "snapshot_tag": str(((context.get("snapshot") or {}).get("tag")) or "").strip(),
+                    "ai_summary": ai_summary,
+                }
+            )
+
+        attempts.sort(key=lambda item: item.get("attempt") or 0)
+        latest_attempt = attempts[-1] if attempts else None
+        return {
+            "ok": bool(attempts),
+            "repair_dir": str(repair_dir),
+            "attempts": attempts,
+            "latest_attempt": latest_attempt,
+        }
+
     def _read_json(self, path):
         try:
             return json.loads(Path(path).read_text(encoding="utf-8"))
         except Exception:
             return None
+
+    def _read_text_excerpt(self, path, max_lines=20, max_chars=2200, tail=True):
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except Exception:
+            return ""
+        text = str(text or "").strip()
+        if not text:
+            return ""
+        lines = text.splitlines()
+        if len(lines) > max_lines:
+            lines = lines[-max_lines:] if tail else lines[:max_lines]
+        text = "\n".join(lines).strip()
+        if len(text) > max_chars:
+            text = text[-max_chars:] if tail else text[:max_chars]
+        return text.strip()
+
+    def _extract_attempt_number(self, stem, fallback=0):
+        try:
+            return int(str(stem).split("-")[1])
+        except Exception:
+            return int(fallback or 0)
 
     def _iso_from_timestamp(self, timestamp):
         return datetime.utcfromtimestamp(timestamp).isoformat() + "Z"
@@ -952,6 +1028,47 @@ class TestDebugSystem:
             f"{index}. {step['name']}  ->  {step['command']}"
             for index, step in enumerate(plan, start=1)
         )
+
+    def format_repair_history(self, history):
+        attempts = history.get("attempts") or []
+        if not attempts:
+            return "No repair artifacts yet for this incident."
+
+        latest = history.get("latest_attempt") or attempts[-1]
+        lines = [
+            f"Repair folder: {history.get('repair_dir')}",
+            f"Attempts detected: {len(attempts)}",
+            f"Latest attempt: {latest.get('attempt')}",
+            f"Latest diagnosis: {latest.get('diagnosis_category') or 'unknown'}",
+            f"Latest failed step: {latest.get('failed_step_name') or 'unknown'}",
+        ]
+        if latest.get("snapshot_branch") or latest.get("snapshot_tag"):
+            lines.append(
+                "Snapshot: "
+                f"{latest.get('snapshot_branch') or 'n/a'} | "
+                f"{latest.get('snapshot_tag') or 'n/a'}"
+            )
+        if latest.get("ai_summary"):
+            lines.extend(
+                [
+                    "",
+                    "Latest AI summary:",
+                    latest["ai_summary"],
+                ]
+            )
+
+        lines.extend(["", "Attempts:"])
+        for item in attempts:
+            details = (
+                f"attempt {item.get('attempt')} | "
+                f"{item.get('diagnosis_category') or 'unknown'} | "
+                f"{item.get('failed_step_name') or 'unknown'}"
+            )
+            if item.get("last_message_file"):
+                details += " | ai-summary"
+            lines.append(details)
+
+        return "\n".join(lines)
 
     def strip_log_tags(self, message):
         cursor = str(message or "")

@@ -30,6 +30,7 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._current_incident = None
         self._current_analysis = None
         self._current_plan = []
+        self._current_repair_history = None
         self._run_thread = None
         self._stop_event = None
         self._repair_thread = None
@@ -258,6 +259,35 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._run_log = LogBox(run_card, height=220)
         self._run_log.pack(fill="x", padx=PAD, pady=(0, PAD_SM))
 
+        artifacts_card = Card(scroll)
+        artifacts_card.pack(fill="x", pady=(0, PAD_SM))
+        artifacts_header = ctk.CTkFrame(artifacts_card, fg_color="transparent")
+        artifacts_header.pack(fill="x", padx=PAD, pady=(PAD_SM, 6))
+        Label(artifacts_header, text="Repair Artifacts", size=13, bold=True).pack(side="left")
+        SecondaryButton(
+            artifacts_header, text="Refresh Artifacts", width=130, height=32, command=self._refresh_repair_history
+        ).pack(side="right")
+        self._repair_artifacts_box = LogBox(artifacts_card, height=180)
+        self._repair_artifacts_box.pack(fill="x", padx=PAD, pady=(0, 8))
+
+        artifacts_btn_row = ctk.CTkFrame(artifacts_card, fg_color="transparent")
+        artifacts_btn_row.pack(fill="x", padx=PAD, pady=(0, PAD_SM))
+        self._open_latest_brief_btn = SecondaryButton(
+            artifacts_btn_row, text="Open Latest Brief", width=140, height=34, state="disabled",
+            command=lambda: self._open_latest_repair_file("brief_file")
+        )
+        self._open_latest_brief_btn.pack(side="left", padx=(0, 8))
+        self._open_latest_summary_btn = SecondaryButton(
+            artifacts_btn_row, text="Open AI Summary", width=130, height=34, state="disabled",
+            command=lambda: self._open_latest_repair_file("last_message_file")
+        )
+        self._open_latest_summary_btn.pack(side="left", padx=(0, 8))
+        self._open_latest_command_log_btn = SecondaryButton(
+            artifacts_btn_row, text="Open Command Log", width=140, height=34, state="disabled",
+            command=lambda: self._open_latest_repair_file("command_log_file")
+        )
+        self._open_latest_command_log_btn.pack(side="left")
+
         self._badge = StatusBadge(scroll, status="pending", text="Select an incident to begin")
         self._badge.pack(anchor="w")
 
@@ -344,6 +374,7 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._current_incident = incident
         self._current_analysis = None
         self._current_plan = []
+        self._current_repair_history = None
 
         for incident_id, button in self._incident_buttons.items():
             button.configure(
@@ -382,6 +413,7 @@ class PanelTestDebugging(ctk.CTkFrame):
         else:
             repair_command = self._system.default_repair_command_template()
         self._repair_cmd_var.set(repair_command)
+        self._refresh_repair_history()
         self._badge.update_status("info", f"Incident selected: {self._short_id(incident.get('deployment_id'))}")
 
     def _resolve_repo_mapping(self, incident):
@@ -584,6 +616,7 @@ class PanelTestDebugging(ctk.CTkFrame):
             self._run_btn.configure(state="normal")
             self._stop_btn.configure(state="disabled")
             self._analyze_btn.configure(state="normal")
+            self._refresh_repair_history()
             if result.get("ok"):
                 self._badge.update_status("ok", "Repair loop reached green")
             elif result.get("handoff_ready"):
@@ -600,6 +633,34 @@ class PanelTestDebugging(ctk.CTkFrame):
         deployment_dir = self._current_incident.get("deployment_dir") or ""
         repair_dir = Path(deployment_dir) / "repair-loop"
         self._open_path(str(repair_dir))
+
+    def _refresh_repair_history(self):
+        if not self._current_incident:
+            self._current_repair_history = None
+            self._replace_logbox(self._repair_artifacts_box, "Select an incident to inspect repair artifacts.")
+            self._update_repair_artifact_buttons()
+            return
+
+        history = self._system.inspect_repair_history(self._current_incident)
+        self._current_repair_history = history
+        self._replace_logbox(self._repair_artifacts_box, self._system.format_repair_history(history))
+        self._update_repair_artifact_buttons()
+
+    def _update_repair_artifact_buttons(self):
+        latest = ((self._current_repair_history or {}).get("latest_attempt")) or {}
+        self._open_latest_brief_btn.configure(
+            state="normal" if latest.get("brief_file") else "disabled"
+        )
+        self._open_latest_summary_btn.configure(
+            state="normal" if latest.get("last_message_file") else "disabled"
+        )
+        self._open_latest_command_log_btn.configure(
+            state="normal" if latest.get("command_log_file") else "disabled"
+        )
+
+    def _open_latest_repair_file(self, key):
+        latest = ((self._current_repair_history or {}).get("latest_attempt")) or {}
+        self._open_path(latest.get(key))
 
     # ---------- Helpers ----------
 
