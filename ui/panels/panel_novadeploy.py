@@ -1,4 +1,4 @@
-"""Panel – NovaDeploy failed-build monitor."""
+"""Panel – NovaDeploy live build monitor."""
 import json
 import os
 import threading
@@ -26,6 +26,16 @@ from ui.widgets.common import (
 DEFAULT_API_BASE = "https://novadeploy-backend.onrender.com/api"
 DEFAULT_INTERVAL = "30 sec"
 INTERVAL_OPTIONS = ["15 sec", "30 sec", "60 sec", "120 sec"]
+ACTIVE_DEPLOYMENT_STATUSES = {
+    "QUEUED",
+    "BUILDING",
+    "TESTING",
+    "STAGING",
+    "AWAITING_APPROVAL",
+    "DEPLOYING",
+}
+FINAL_DEPLOYMENT_STATUSES = {"FAILED", "LIVE", "ROLLED_BACK"}
+MAX_LIVE_TAIL_LINES = 180
 
 
 class PanelNovaDeploy(ctk.CTkFrame):
@@ -38,8 +48,13 @@ class PanelNovaDeploy(ctk.CTkFrame):
         self._checking = False
         self._monitor_thread = None
         self._processed = set(self.cfg.get("novadeploy_processed_failures", []))
+        self._live_seen = {}
+        self._live_status = {}
+        self._last_active_ids = set()
+        self._live_lines = []
         self._stats = {
             "checks": 0,
+            "active": 0,
             "exports": 0,
             "last_deployment": "—",
         }
@@ -54,7 +69,7 @@ class PanelNovaDeploy(ctk.CTkFrame):
         Label(scroll, text="NovaDeploy Monitor", size=22, bold=True).pack(anchor="w", pady=(0, 4))
         Label(
             scroll,
-            text="Monitor failed builds, pull the last 500 developer logs, and save them locally for analysis.",
+            text="Follow active NovaDeploy builds from Render, tail developer logs in near real time, and export failed builds locally.",
             size=12,
             color=TEXT_DIM,
         ).pack(anchor="w", pady=(0, PAD))
@@ -182,6 +197,7 @@ class PanelNovaDeploy(ctk.CTkFrame):
         stat_row.columnconfigure(0, weight=1)
         stat_row.columnconfigure(1, weight=1)
         stat_row.columnconfigure(2, weight=1)
+        stat_row.columnconfigure(3, weight=1)
 
         def make_stat_block(parent, col, title, default_text="0"):
             frame = ctk.CTkFrame(parent, fg_color=BG3, corner_radius=8)
@@ -192,9 +208,10 @@ class PanelNovaDeploy(ctk.CTkFrame):
             return lbl
 
         self._checks_lbl = make_stat_block(stat_row, 0, "Checks")
-        self._exports_lbl = make_stat_block(stat_row, 1, "Exports")
+        self._active_lbl = make_stat_block(stat_row, 1, "Active")
+        self._exports_lbl = make_stat_block(stat_row, 2, "Exports")
         last_frame = ctk.CTkFrame(stat_row, fg_color=BG3, corner_radius=8)
-        last_frame.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        last_frame.grid(row=0, column=3, sticky="ew", padx=(4, 0))
         Label(last_frame, text="Last Deployment", size=10, color=TEXT_MUTED).pack(
             anchor="w", padx=8, pady=(6, 0)
         )
@@ -205,6 +222,23 @@ class PanelNovaDeploy(ctk.CTkFrame):
         badge_row.pack(fill="x", padx=PAD, pady=(0, PAD_SM))
         self._state_badge = StatusBadge(badge_row, status="pending", text="● Idle")
         self._state_badge.pack(side="left")
+
+        live_card = Card(scroll)
+        live_card.pack(fill="x", pady=(0, PAD_SM))
+        live_header = ctk.CTkFrame(live_card, fg_color="transparent")
+        live_header.pack(fill="x", padx=PAD, pady=(PAD_SM, 4))
+        Label(live_header, text="Live Developer Tail", size=13, bold=True).pack(side="left")
+        SecondaryButton(
+            live_header, text="Clear Tail", width=100, height=32, command=self._clear_live_tail
+        ).pack(side="right")
+        Label(
+            live_card,
+            text="Shows new developer log lines from active deployments as NovaDeploy receives them.",
+            size=11,
+            color=TEXT_DIM,
+        ).pack(anchor="w", padx=PAD, pady=(0, 6))
+        self._live_logbox = LogBox(live_card, height=260)
+        self._live_logbox.pack(fill="x", padx=PAD, pady=(0, PAD_SM))
 
         log_card = Card(scroll)
         log_card.pack(fill="x", pady=(0, PAD_SM))
@@ -249,6 +283,11 @@ class PanelNovaDeploy(ctk.CTkFrame):
         self._processed = set()
         self.cfg.set("novadeploy_processed_failures", [])
         self._log("Cleared processed failed deployment memory.")
+
+    def _clear_live_tail(self):
+        self._live_lines = []
+        self._live_logbox.clear()
+        self._log("Cleared live developer tail.")
 
     def _check_now(self):
         if self._checking:
@@ -319,18 +358,51 @@ class PanelNovaDeploy(ctk.CTkFrame):
             self._sync_stats()
             return
 
-        failed = [
-            item
-            for item in list(deployments or [])
-            if str(item.get("status", "")).upper() == "FAILED"
-        ]
+        deployments = list(deployments or [])
+        payloads_by_id = {}
+        active_ids = set()
+        failed = []
+
+        for deployment in deployments:
+            deployment_id = str(deployment.get("id") or "").strip()
+            status = str(deployment.get("status") or "").upper()
+            if not deployment_id:
+                continue
+            previous_status = self._live_status.get(deployment_id)
+            self._live_status[deployment_id] = status
+
+            if status in ACTIVE_DEPLOYMENT_STATUSES:
+                active_ids.add(deployment_id)
+                if previous_status != status:
+                    self._log(
+                        f"Tracking active deployment {deployment_id} -> {status}"
+                    )
+                ok_logs, payload = self._api.get_developer_logs(deployment_id, limit=500)
+                if not ok_logs:
+                    self._log(f"Failed to fetch live logs for {deployment_id}: {payload}")
+                    continue
+                payloads_by_id[deployment_id] = payload
+                self._consume_live_logs(output_dir, deployment, payload)
+                continue
+
+            if status == "FAILED":
+                failed.append(deployment)
+            elif (
+                previous_status in ACTIVE_DEPLOYMENT_STATUSES
+                and status in FINAL_DEPLOYMENT_STATUSES
+            ):
+                self._log(f"Deployment {deployment_id} finished with status {status}")
 
         exported = 0
         for deployment in failed:
             deployment_id = str(deployment.get("id") or "").strip()
             if not deployment_id or deployment_id in self._processed:
                 continue
-            ok_logs, payload = self._api.get_developer_logs(deployment_id, limit=500)
+            ok_logs, payload = (
+                (True, payloads_by_id[deployment_id])
+                if deployment_id in payloads_by_id
+                else self._api.get_developer_logs(deployment_id, limit=500)
+            )
             if not ok_logs:
                 self._log(f"Failed to fetch logs for {deployment_id}: {payload}")
                 continue
@@ -343,17 +415,62 @@ class PanelNovaDeploy(ctk.CTkFrame):
                 f"Exported failed build {deployment_id} -> {result['log_path'].name} | {result['summary']}"
             )
 
+        self._stats["active"] = len(active_ids)
+        for deployment_id in self._last_active_ids - active_ids:
+            self._live_seen.pop(deployment_id, None)
+
+        self._last_active_ids = active_ids
         self.cfg.set("novadeploy_processed_failures", sorted(self._processed))
-        if exported == 0:
-            self._log("Check complete. No new failed builds to export.")
 
         self.after(
             0,
             lambda: self._state_badge.update_status(
-                "ok", f"Checked {len(deployments or [])} deployments"
+                "ok",
+                f"Watching {len(active_ids)} active build(s)"
+                if active_ids
+                else f"Checked {len(deployments)} deployments",
             ),
         )
         self._sync_stats()
+
+    def _consume_live_logs(self, output_dir, deployment, payload):
+        deployment_id = str(payload.get("deploymentId") or deployment.get("id") or "unknown")
+        project_id = str(payload.get("projectId") or deployment.get("projectId") or "unknown-project")
+        status = str(payload.get("status") or deployment.get("status") or "").upper() or "UNKNOWN"
+        logs = list(payload.get("logs") or [])
+        seen = self._live_seen.get(deployment_id, set())
+        current_keys = {self._entry_key(entry) for entry in logs}
+        new_entries = [entry for entry in logs if self._entry_key(entry) not in seen]
+        self._live_seen[deployment_id] = current_keys
+
+        target_dir = output_dir / project_id / deployment_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        (target_dir / "latest.json").write_text(
+            json.dumps(
+                {
+                    "polledAt": datetime.now(timezone.utc).isoformat(),
+                    "deployment": deployment,
+                    "developerLogs": payload,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        if not new_entries:
+            return
+
+        live_log_path = target_dir / "live.log"
+        with live_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(self._render_log_text(new_entries))
+
+        prefix = self._short_id(deployment_id)
+        for entry in new_entries:
+            timestamp = str(entry.get("timestamp") or "").strip()
+            level = str(entry.get("level") or "info").upper()
+            message = str(entry.get("message") or "").rstrip()
+            line = f"[{prefix}][{status}][{timestamp}][{level}] {message}"
+            self._append_live_line(line)
 
     def _store_failed_build(self, output_dir, deployment, payload):
         deployment_id = str(payload.get("deploymentId") or deployment.get("id") or "unknown")
@@ -414,8 +531,30 @@ class PanelNovaDeploy(ctk.CTkFrame):
             cursor = cursor[end + 1 :].lstrip()
         return cursor or message
 
+    def _append_live_line(self, line):
+        self._live_lines.append(line)
+        if len(self._live_lines) > MAX_LIVE_TAIL_LINES:
+            self._live_lines = self._live_lines[-MAX_LIVE_TAIL_LINES:]
+
+        def _render():
+            self._live_logbox.clear()
+            for item in self._live_lines:
+                self._live_logbox.append(item)
+
+        self.after(0, _render)
+
+    def _entry_key(self, entry):
+        return "|".join(
+            [
+                str(entry.get("timestamp") or "").strip(),
+                str(entry.get("level") or "").strip(),
+                str(entry.get("message") or "").strip(),
+            ]
+        )
+
     def _sync_stats(self):
         self.after(0, lambda: self._checks_lbl.configure(text=str(self._stats["checks"])))
+        self.after(0, lambda: self._active_lbl.configure(text=str(self._stats["active"])))
         self.after(0, lambda: self._exports_lbl.configure(text=str(self._stats["exports"])))
         self.after(0, lambda: self._last_lbl.configure(text=self._stats["last_deployment"]))
 
