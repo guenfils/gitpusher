@@ -2,11 +2,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #  install.sh  —  Install Git Pusher as a desktop application
 # ─────────────────────────────────────────────────────────────────────────────
-set -e
+set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="git-pusher"
-VERSION="2.0.0"
+VERSION="2.1.0"
 SCRIPT_DIR="$(realpath .)"
 INSTALL_DIR="$HOME/.local/bin"
 ICON_DIR="$HOME/.local/share/icons/hicolor"
@@ -36,12 +36,12 @@ else
     echo -e "  ${DIM}   Run ./build.sh first to create a standalone binary.${RESET}"
     echo ""
 
-    # Ensure deps are installed
-    pip3 install -q -r requirements.txt 2>/dev/null || true
-
     cat > "$INSTALL_DIR/${APP}" << WRAPPER
 #!/usr/bin/env bash
 cd "${SCRIPT_DIR}"
+if [ -x ".venv/bin/python" ]; then
+    exec .venv/bin/python main.py "\$@"
+fi
 exec python3 main.py "\$@"
 WRAPPER
     chmod +x "$INSTALL_DIR/${APP}"

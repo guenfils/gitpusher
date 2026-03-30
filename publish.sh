@@ -3,10 +3,10 @@
 #  publish.sh  —  Full automated publish: git init → build → release
 #  Supports GitHub (via gh CLI) and GitLab (via API)
 # ─────────────────────────────────────────────────────────────────────────────
-set -e
+set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 APP="git-pusher"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -173,14 +173,14 @@ git add .
 if git diff --cached --quiet; then
     ok "Nothing new to commit"
 else
-    git commit -m "feat: initial release v${VERSION} — full repo manager with 25 features
+    git commit -m "release: v${VERSION} stable build with NovaDeploy and AI debugging
 
 - 6-step push wizard (.gitignore, secret scanner, README generator)
-- 20-panel Repo Manager (clone, sync, branches, gitflow, diff, stash...)
+- 22-panel Repo Manager (clone, sync, branches, gitflow, diff, stash...)
 - Multi-account GitHub + GitLab support
 - Scheduled push and Watch Mode automation
 - SSH Key Manager, Webhooks, Issue tracker, Collaborators
-- Professional logo and dark theme UI"
+- NovaDeploy monitor, live developer logs, and Test & Debugging"
     ok "Initial commit created"
 fi
 
@@ -409,15 +409,18 @@ step "7/7" "Publishing release"
 
 RELEASE_NOTES="## Git Pusher v${VERSION}
 
-The first major release — free, open-source GUI for GitHub & GitLab on Linux.
+Stable release for GitHub, GitLab, and NovaDeploy workflows on Linux.
 
 ### Highlights
 - 🚀 6-step push wizard with .gitignore generator, secret scanner, README generator
-- 📁 20-panel Repo Manager: clone, sync, branches, gitflow, diff, stash and more
+- 📁 22-panel Repo Manager: clone, sync, branches, gitflow, diff, stash and more
 - 👥 Multi-account support (multiple GitHub + GitLab accounts)
 - ⏰ Scheduled push and Watch Mode (auto-commit on file changes)
 - 🔑 SSH Key Manager, Webhooks, Issues tracker, Collaborators panel
 - 🌿 Gitflow automation — feature/release/hotfix/bugfix workflows
+- 🚦 NovaDeploy monitor with live GitHub Actions developer logs
+- 🧪 Test & Debugging workflow with approvals, rollback, and repair loops
+- 🤖 Local \`codex\` and \`claude\` CLI integration with no AI API key storage
 
 ### Installation
 

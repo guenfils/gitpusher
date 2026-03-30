@@ -22,10 +22,18 @@ DEFAULT_ALLOWED_PUSH_REMOTES = ("origin", "gitlab")
 APPROVAL_QUEUE_ACTIONS = ("repair", "commit", "push")
 APP_ROOT = Path(__file__).resolve().parent.parent
 REPAIR_AGENT_PATH = APP_ROOT / "core" / "repair_agent.py"
-DEFAULT_REPAIR_COMMAND_TEMPLATE = (
-    f"python3 {shlex.quote(str(REPAIR_AGENT_PATH))} "
-    "--repo {repo_path} --context {context_file}"
-)
+AI_RUNTIMES = {
+    "codex": {
+        "label": "ChatGPT / Codex",
+        "description": "Uses the local Codex CLI session, like VS Code. Git Pusher does not store or send an OpenAI AI API key for this flow.",
+        "bin": "codex",
+    },
+    "claude": {
+        "label": "Claude",
+        "description": "Uses the local Claude CLI session, like Claude Code. Git Pusher does not store or send an Anthropic AI API key for this flow.",
+        "bin": "claude",
+    },
+}
 SKIP_DIRS = {
     ".git",
     "node_modules",
@@ -99,9 +107,66 @@ class TestDebugSystem:
         self._active_process = None
         self._git = GitManager()
         self._node_runtime = self._discover_node_runtime()
+        self._ai_runtimes = self._discover_ai_runtimes()
 
-    def default_repair_command_template(self):
-        return DEFAULT_REPAIR_COMMAND_TEMPLATE
+    def _discover_ai_runtimes(self):
+        runtimes = {}
+        for key, meta in AI_RUNTIMES.items():
+            bin_name = meta.get("bin") or key
+            binary = shutil.which(bin_name)
+            version = self._safe_capture([binary, "--version"]) if binary else ""
+            runtimes[key] = {
+                "available": bool(binary),
+                "path": binary or "",
+                "version": version,
+            }
+        return runtimes
+
+    def ai_runtime_choices(self):
+        return [(key, data["label"]) for key, data in AI_RUNTIMES.items()]
+
+    def default_ai_runtime(self):
+        if (self._ai_runtimes.get("codex") or {}).get("available"):
+            return "codex"
+        if (self._ai_runtimes.get("claude") or {}).get("available"):
+            return "claude"
+        return "codex"
+
+    def get_ai_runtime(self, value=None):
+        key = str(value or "").strip().lower() or self.default_ai_runtime()
+        if key not in AI_RUNTIMES:
+            key = self.default_ai_runtime()
+        runtime = dict(AI_RUNTIMES[key])
+        detected = dict(self._ai_runtimes.get(key) or {})
+        runtime["key"] = key
+        runtime["available"] = bool(detected.get("available"))
+        runtime["path"] = str(detected.get("path") or "")
+        runtime["version"] = str(detected.get("version") or "")
+        return runtime
+
+    def format_ai_runtime_summary(self):
+        lines = []
+        for key, meta in AI_RUNTIMES.items():
+            runtime = self.get_ai_runtime(key)
+            status = "available" if runtime.get("available") else "not found"
+            details = runtime.get("version") or runtime.get("path") or meta.get("bin") or key
+            lines.append(f"- {meta['label']}: {status} ({details})")
+        return "\n".join(lines)
+
+    def ai_runtime_summary_inline(self):
+        parts = []
+        for key, meta in AI_RUNTIMES.items():
+            runtime = self.get_ai_runtime(key)
+            status = "available" if runtime.get("available") else "not found"
+            parts.append(f"{meta['label']}: {status}")
+        return " | ".join(parts)
+
+    def default_repair_command_template(self, runtime_key=None):
+        runtime = self.get_ai_runtime(runtime_key)
+        return (
+            f"python3 {shlex.quote(str(REPAIR_AGENT_PATH))} "
+            f"--runtime {runtime['key']} --repo {{repo_path}} --context {{context_file}}"
+        )
 
     def default_approval_mode(self):
         return "repair_only"
@@ -378,10 +443,15 @@ class TestDebugSystem:
             brief_file = repair_dir / f"{stem}-brief.md"
             output_file = repair_dir / f"{stem}-failed-output.log"
             command_log_file = repair_dir / f"{stem}-repair-command.log"
-            prompt_file = repair_dir / f"{stem}-codex-prompt.md"
-            last_message_file = repair_dir / f"{stem}-codex-last-message.md"
+            prompt_file = repair_dir / f"{stem}-ai-prompt.md"
+            if not prompt_file.exists():
+                prompt_file = repair_dir / f"{stem}-codex-prompt.md"
+            last_message_file = repair_dir / f"{stem}-ai-last-message.md"
+            if not last_message_file.exists():
+                last_message_file = repair_dir / f"{stem}-codex-last-message.md"
             failed_step = ((context.get("failedStep") or {}).get("step")) or {}
             diagnosis = context.get("diagnosis") or {}
+            ai_runtime = context.get("aiRuntime") or {}
             ai_summary = self._read_text_excerpt(last_message_file, max_lines=20, max_chars=2200, tail=False)
             attempts.append(
                 {
@@ -396,6 +466,8 @@ class TestDebugSystem:
                     "failed_step_command": str(failed_step.get("command") or "").strip(),
                     "diagnosis_category": str(diagnosis.get("category") or "").strip(),
                     "diagnosis_hint": str(diagnosis.get("hint") or "").strip(),
+                    "ai_runtime_key": str(ai_runtime.get("key") or "").strip(),
+                    "ai_runtime_label": str(ai_runtime.get("label") or "").strip(),
                     "snapshot_branch": str(((context.get("snapshot") or {}).get("branch")) or "").strip(),
                     "snapshot_tag": str(((context.get("snapshot") or {}).get("tag")) or "").strip(),
                     "ai_summary": ai_summary,
@@ -716,6 +788,7 @@ class TestDebugSystem:
             "is_git_repo": (root / ".git").exists(),
             "package_manager": package_manager,
             "node_runtime": self.node_runtime_summary(),
+            "ai_runtimes": self.ai_runtime_summary_inline(),
             "architecture": architecture,
             "languages": languages,
             "frameworks": frameworks,
@@ -1056,6 +1129,7 @@ class TestDebugSystem:
             "project": str((incident or {}).get("project_name") or (incident or {}).get("project_id") or "").strip(),
             "deployment_id": str((incident or {}).get("deployment_id") or "").strip(),
             "summary": self.strip_log_tags(str((incident or {}).get("summary") or "").strip()),
+            "ai_runtime": str(latest_attempt.get("ai_runtime_label") or latest_attempt.get("ai_runtime_key") or "").strip(),
             "failed_step_name": str(latest_attempt.get("failed_step_name") or "").strip(),
             "failed_step_command": str(latest_attempt.get("failed_step_command") or "").strip(),
             "diagnosis_category": str(latest_attempt.get("diagnosis_category") or "").strip(),
@@ -1073,6 +1147,7 @@ class TestDebugSystem:
             f"Project: {context.get('project') or 'unknown'}",
             f"Deployment: {context.get('deployment_id') or 'unknown'}",
             f"Summary: {context.get('summary') or 'No summary'}",
+            f"AI runtime: {context.get('ai_runtime') or 'unknown'}",
             f"Failed step: {context.get('failed_step_name') or 'unknown'}",
         ]
         if context.get("failed_step_command"):
@@ -1503,6 +1578,7 @@ class TestDebugSystem:
         stop_event=None,
         max_attempts=3,
         repair_command_template="",
+        ai_runtime="",
     ):
         root = Path(repo_path).expanduser()
         if not root.exists():
@@ -1582,6 +1658,7 @@ class TestDebugSystem:
                 results=result.get("results") or [],
                 failed_step=failed_step,
                 repo_path=str(root),
+                ai_runtime=ai_runtime,
             )
             context_paths = self._write_repair_context(repair_dir, context)
             last_context = context_paths
@@ -1620,11 +1697,12 @@ class TestDebugSystem:
                 incident_file=incident.get("payload_path") or "",
                 project_id=incident.get("project_id") or "",
                 deployment_id=incident.get("deployment_id") or "",
+                ai_runtime=ai_runtime,
             )
             on_event(
                 {
                     "type": "repair_command_started",
-                    "message": f"Running repair command for attempt {attempt}: {repair_command}",
+                    "message": f"Running {self.get_ai_runtime(ai_runtime).get('label')} repair command for attempt {attempt}: {repair_command}",
                     "attempt": attempt,
                 }
             )
@@ -2080,6 +2158,7 @@ class TestDebugSystem:
         results,
         failed_step,
         repo_path,
+        ai_runtime="",
     ):
         failed_output = (failed_step or {}).get("output") or ""
         diagnosis = self._classify_failure(
@@ -2102,6 +2181,7 @@ class TestDebugSystem:
             },
             "analysis": analysis,
             "plan": plan,
+            "aiRuntime": self.get_ai_runtime(ai_runtime),
             "snapshot": snapshot,
             "repoStateBefore": repo_state_before,
             "failedStep": failed_step,
@@ -2169,7 +2249,9 @@ class TestDebugSystem:
         incident_file,
         project_id,
         deployment_id,
+        ai_runtime="",
     ):
+        runtime = self.get_ai_runtime(ai_runtime)
         values = {
             "repo_path": shlex.quote(repo_path),
             "repo_path_raw": repo_path,
@@ -2187,6 +2269,9 @@ class TestDebugSystem:
             "repair_agent_raw": str(REPAIR_AGENT_PATH),
             "git_pusher_root": shlex.quote(str(APP_ROOT)),
             "git_pusher_root_raw": str(APP_ROOT),
+            "ai_runtime": shlex.quote(runtime["key"]),
+            "ai_runtime_raw": runtime["key"],
+            "ai_runtime_label": runtime["label"],
         }
         return str(template).format_map(values)
 
@@ -2255,6 +2340,7 @@ class TestDebugSystem:
             f"Architecture: {analysis.get('architecture')}",
             f"Package manager: {analysis.get('package_manager')}",
             f"Node runtime: {analysis.get('node_runtime') or 'missing'}",
+            f"Local AI runtimes: {analysis.get('ai_runtimes') or 'unknown'}",
             f"Languages: {', '.join(analysis.get('languages') or ['Unknown'])}",
             f"Frameworks: {', '.join(analysis.get('frameworks') or ['Unknown'])}",
             f"Git repo: {'yes' if analysis.get('is_git_repo') else 'no'}",
@@ -2284,6 +2370,7 @@ class TestDebugSystem:
             f"Repair folder: {history.get('repair_dir')}",
             f"Attempts detected: {len(attempts)}",
             f"Latest attempt: {latest.get('attempt')}",
+            f"Latest AI runtime: {latest.get('ai_runtime_label') or latest.get('ai_runtime_key') or 'unknown'}",
             f"Latest diagnosis: {latest.get('diagnosis_category') or 'unknown'}",
             f"Latest failed step: {latest.get('failed_step_name') or 'unknown'}",
         ]
@@ -2306,6 +2393,7 @@ class TestDebugSystem:
         for item in attempts:
             details = (
                 f"attempt {item.get('attempt')} | "
+                f"{item.get('ai_runtime_label') or item.get('ai_runtime_key') or 'unknown-ai'} | "
                 f"{item.get('diagnosis_category') or 'unknown'} | "
                 f"{item.get('failed_step_name') or 'unknown'}"
             )

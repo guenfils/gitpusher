@@ -1,5 +1,6 @@
 """Settings & Preferences panel."""
 import os
+import shlex
 import customtkinter as ctk
 from ui.theme import *
 from ui.widgets.common import Card, PrimaryButton, SecondaryButton, Label, SectionHeader, StatusBadge
@@ -14,6 +15,9 @@ class PanelSettings(ctk.CTkFrame):
         self._build_ui()
 
     def _build_ui(self):
+        config_dir = CONFIG_PATH.parent
+        config_file = CONFIG_PATH
+
         # Scrollable container
         scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
         scroll.pack(fill="both", expand=True, padx=0, pady=0)
@@ -22,7 +26,7 @@ class PanelSettings(ctk.CTkFrame):
         header = ctk.CTkFrame(scroll, fg_color="transparent")
         header.pack(fill="x", padx=PAD, pady=(PAD, PAD_SM))
         Label(header, text="Settings & Preferences", size=22, bold=True).pack(anchor="w")
-        Label(header, text=f"Saved to {CONFIG_PATH}", size=11, color=TEXT_MUTED).pack(anchor="w")
+        Label(header, text=f"Saved to {config_file}", size=11, color=TEXT_MUTED).pack(anchor="w")
 
         # ── Push Wizard Defaults ──────────────────────────────
         wiz_card = Card(scroll)
@@ -110,7 +114,7 @@ class PanelSettings(ctk.CTkFrame):
         Label(gl_url_row, text="GitLab URL:", size=12).pack(side="left", padx=(0, 8))
         Label(gl_url_row, text=self.cfg.get_gitlab_url(), size=12, color=TEXT_DIM).pack(side="left")
 
-        Label(auth_card, text="Tokens are saved to ~/.config/git-pusher/config.json",
+        Label(auth_card, text=f"Tokens are saved to {config_file}",
               size=11, color=TEXT_MUTED).pack(anchor="w", padx=PAD_SM, pady=(0, PAD_SM))
 
         SecondaryButton(
@@ -194,17 +198,17 @@ class PanelSettings(ctk.CTkFrame):
         SectionHeader(about_card, "i", "About", "").pack(fill="x", padx=PAD_SM, pady=(PAD_SM, PAD_SM))
         Label(about_card, text="Git Pusher — GitHub & GitLab in one click", size=13, bold=True).pack(
             anchor="w", padx=PAD_SM, pady=(0, 4))
-        Label(about_card, text="Developed by Guenson  •  v2.0.0", size=12, color=TEXT_DIM).pack(
+        Label(about_card, text="Developed by Guenson  •  v2.1.0", size=12, color=TEXT_DIM).pack(
             anchor="w", padx=PAD_SM, pady=(0, 4))
         Label(about_card, text="github.com/guenfils  |  gitlab.com/guenson", size=11, color=TEXT_MUTED).pack(
             anchor="w", padx=PAD_SM, pady=(0, 4))
-        Label(about_card, text="Config: ~/.config/git-pusher/config.json", size=11, color=TEXT_MUTED).pack(
+        Label(about_card, text=f"Config: {config_file}", size=11, color=TEXT_MUTED).pack(
             anchor="w", padx=PAD_SM, pady=(0, PAD_SM))
         about_btns = ctk.CTkFrame(about_card, fg_color="transparent")
         about_btns.pack(anchor="w", padx=PAD_SM, pady=(0, PAD_SM))
         SecondaryButton(
             about_btns, text="Open Config Folder", width=160, height=34,
-            command=lambda: os.system("xdg-open ~/.config/git-pusher"),
+            command=lambda: os.system(f"xdg-open {shlex.quote(str(config_dir))}"),
         ).pack(side="left", padx=(0, 8))
         SecondaryButton(
             about_btns, text="Reset to Defaults", width=140, height=34,

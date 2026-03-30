@@ -34,7 +34,10 @@ a = Analysis(
         "core.gitlab_api",
         "core.config_manager",
         "core.gitignore_manager",
+        "core.novadeploy_api",
+        "core.test_debugging",
         "core.secret_scanner",
+        "core.repair_agent",
         # ── ui base ────────────────────────────────────
         "ui.app",
         "ui.theme",
@@ -47,7 +50,7 @@ a = Analysis(
         "ui.steps.step_readme",
         "ui.steps.step_branch",
         "ui.steps.step_upload",
-        # ── panels (20) ────────────────────────────────
+        # ── panels (22) ────────────────────────────────
         "ui.panels.panel_repos",
         "ui.panels.panel_clone",
         "ui.panels.panel_sync",
@@ -61,6 +64,8 @@ a = Analysis(
         "ui.panels.panel_accounts",
         "ui.panels.panel_scheduled",
         "ui.panels.panel_watch",
+        "ui.panels.panel_novadeploy",
+        "ui.panels.panel_test_debugging",
         "ui.panels.panel_stats",
         "ui.panels.panel_export",
         "ui.panels.panel_stash",

@@ -4,7 +4,15 @@ import os
 from pathlib import Path
 
 
-CONFIG_PATH = Path.home() / ".config" / "git-pusher" / "config.json"
+def _resolve_config_root():
+    override = str(os.environ.get("GIT_PUSHER_CONFIG_ROOT") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".config" / "git-pusher"
+
+
+CONFIG_ROOT = _resolve_config_root()
+CONFIG_PATH = CONFIG_ROOT / "config.json"
 
 
 class ConfigManager:

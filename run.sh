@@ -19,22 +19,20 @@ fi
 PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 echo -e "  ${GREEN}✓${RESET}  Python ${PY_VER}"
 
-# ── Dependency check (fast, no install) ───────────────────────────────────────
-MISSING=()
-for pkg in customtkinter PIL requests paramiko cryptography darkdetect; do
-    python3 -c "import $pkg" 2>/dev/null || MISSING+=("$pkg")
-done
-
-if [ ${#MISSING[@]} -gt 0 ]; then
-    echo -e "  ${YELLOW}⚠  Missing packages: ${MISSING[*]}${RESET}"
-    echo -e "  ${DIM}Installing...${RESET}"
-    pip3 install -q -r requirements.txt
-    echo -e "  ${GREEN}✓${RESET}  Dependencies installed"
-else
-    echo -e "  ${GREEN}✓${RESET}  Dependencies OK"
+# ── Bootstrap dev environment ────────────────────────────────────────────────
+echo -e "  ${DIM}Running dev bootstrap...${RESET}"
+if ! python3 -m core.dev_bootstrap --bootstrap --install-missing; then
+    echo ""
+    echo -e "${RED}  ✗  Dev bootstrap failed.${RESET}"
+    echo -e "  ${DIM}Run ./doctor.sh for a detailed report.${RESET}"
+    exit 1
 fi
+echo -e "  ${GREEN}✓${RESET}  Dev environment ready"
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 echo -e "  ${DIM}Starting...${RESET}"
 echo ""
+if [ -x ".venv/bin/python" ]; then
+    exec .venv/bin/python main.py "$@"
+fi
 exec python3 main.py "$@"

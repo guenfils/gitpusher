@@ -26,12 +26,19 @@ class PanelTestDebugging(ctk.CTkFrame):
         self.app_state = app_state
         self.cfg = ConfigManager()
         self._system = TestDebugSystem()
+        self._ai_runtime_label_to_key = {
+            label: key for key, label in self._system.ai_runtime_choices()
+        }
+        self._ai_runtime_key_to_label = {
+            key: label for key, label in self._system.ai_runtime_choices()
+        }
         self._approval_mode_label_to_key = {
             label: key for key, label in self._system.approval_mode_choices()
         }
         self._approval_mode_key_to_label = {
             key: label for key, label in self._system.approval_mode_choices()
         }
+        self._current_ai_runtime = self._system.get_ai_runtime()
         self._current_approval_mode = self._system.get_approval_mode()
         self._incident_buttons = {}
         self._current_incident = None
@@ -311,10 +318,38 @@ class PanelTestDebugging(ctk.CTkFrame):
         )
         Label(
             repair_card,
-            text="A default Codex repair command is preloaded. Override it if needed, or clear it to keep the loop in handoff-only mode.",
+            text="Use a local AI runtime like ChatGPT/Codex or Claude. Git Pusher does not request, store, or send AI API keys here; it only invokes your local CLI session that is already authenticated on this machine.",
             size=11,
             color=TEXT_DIM,
         ).pack(anchor="w", padx=PAD, pady=(0, 6))
+
+        runtime_row = ctk.CTkFrame(repair_card, fg_color="transparent")
+        runtime_row.pack(fill="x", padx=PAD, pady=(0, 8))
+        Label(runtime_row, text="AI runtime:", size=12, color=TEXT_DIM).pack(side="left", padx=(0, 8))
+        self._ai_runtime_var = ctk.StringVar(
+            value=self._ai_runtime_key_to_label.get(
+                self._system.default_ai_runtime(),
+                next(iter(self._ai_runtime_label_to_key), "ChatGPT / Codex"),
+            )
+        )
+        self._ai_runtime_segment = ctk.CTkSegmentedButton(
+            runtime_row,
+            values=list(self._ai_runtime_label_to_key.keys()),
+            variable=self._ai_runtime_var,
+            fg_color=BG3,
+            selected_color=PRIMARY,
+            selected_hover_color=PRIMARY_H,
+            unselected_color=BG3,
+            unselected_hover_color=BORDER,
+            text_color=TEXT,
+            font=ctk.CTkFont(family="Inter", size=12),
+            command=lambda _value: self._save_ai_runtime_setting(),
+        )
+        self._ai_runtime_segment.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self._ai_runtime_badge = StatusBadge(runtime_row, status="pending", text="Checking")
+        self._ai_runtime_badge.pack(side="left")
+        self._ai_runtime_hint = Label(repair_card, text="", size=11, color=TEXT_DIM)
+        self._ai_runtime_hint.pack(anchor="w", padx=PAD, pady=(0, 8))
 
         approval_row = ctk.CTkFrame(repair_card, fg_color="transparent")
         approval_row.pack(fill="x", padx=PAD, pady=(0, 8))
@@ -391,7 +426,7 @@ class PanelTestDebugging(ctk.CTkFrame):
             corner_radius=8,
             height=36,
             font=ctk.CTkFont(family="Inter", size=12),
-            placeholder_text="python3 .../repair_agent.py --repo {repo_path} --context {context_file}",
+            placeholder_text="python3 .../repair_agent.py --runtime codex --repo {repo_path} --context {context_file}",
             placeholder_text_color=TEXT_MUTED,
         )
         self._repair_cmd_entry.pack(side="left", padx=(0, 8))
@@ -643,10 +678,16 @@ class PanelTestDebugging(ctk.CTkFrame):
         )
         self._set_entry_value(self._incident_root_entry, self._incident_root_var, incident_root)
         config = self.cfg.get_all()
+        ai_runtime = self._system.get_ai_runtime(
+            self.cfg.get("test_debugging_ai_runtime", self._system.default_ai_runtime())
+        )
+        self._ai_runtime_var.set(
+            self._ai_runtime_key_to_label.get(ai_runtime["key"], ai_runtime["label"])
+        )
         if "test_debugging_repair_command" in config:
             repair_command = str(config.get("test_debugging_repair_command") or "")
         else:
-            repair_command = self._system.default_repair_command_template()
+            repair_command = self._system.default_repair_command_template(ai_runtime["key"])
         self._repair_cmd_var.set(repair_command)
         self._repair_attempts_var.set(str(self.cfg.get("test_debugging_repair_attempts", "2")))
         self._require_repair_approval_var.set(bool(self.cfg.get("test_debugging_require_repair_approval", False)))
@@ -674,6 +715,7 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._replace_logbox(self._repo_state_box, "Select and analyze a repository to inspect git state.")
         self._automation_badge.update_status("pending", "No automation activity")
         self._approval_badge.update_status("pending", "No pending approvals")
+        self._apply_ai_runtime_ui(ai_runtime)
         self._apply_approval_mode_ui(approval_mode)
         self._update_repair_artifact_buttons()
         self._reset_safety_gate()
@@ -690,6 +732,33 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._set_entry_value(self._incident_root_entry, self._incident_root_var, folder)
         self.cfg.set("test_debugging_incident_root", folder)
         self._refresh_incidents()
+
+    def _selected_ai_runtime(self):
+        label = str(self._ai_runtime_var.get() or "").strip()
+        key = self._ai_runtime_label_to_key.get(label, self._system.default_ai_runtime())
+        return self._system.get_ai_runtime(key)
+
+    def _apply_ai_runtime_ui(self, runtime=None):
+        runtime = runtime or self._selected_ai_runtime()
+        self._current_ai_runtime = runtime
+        badge_status = "ok" if runtime.get("available") else "warning"
+        badge_text = "Connected" if runtime.get("available") else "Not found"
+        self._ai_runtime_badge.update_status(badge_status, badge_text)
+        self._ai_runtime_hint.configure(
+            text=f"{runtime['description']}\n{self._system.format_ai_runtime_summary()}"
+        )
+
+    def _save_ai_runtime_setting(self, notify=True):
+        previous = dict(self._current_ai_runtime or self._system.get_ai_runtime())
+        runtime = self._selected_ai_runtime()
+        self.cfg.set("test_debugging_ai_runtime", runtime["key"])
+        previous_default = self._system.default_repair_command_template(previous.get("key"))
+        current_command = self._repair_cmd_var.get().strip()
+        if not current_command or current_command == previous_default:
+            self._repair_cmd_var.set(self._system.default_repair_command_template(runtime["key"]))
+        self._apply_ai_runtime_ui(runtime)
+        if notify:
+            self._badge.update_status("ok", f"AI runtime set to {runtime['label']}")
 
     def _save_auto_ingest_setting(self):
         enabled = bool(self._auto_ingest_var.get())
@@ -995,6 +1064,7 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._open_path(self._repo_path_var.get().strip())
 
     def _save_repair_settings(self):
+        self.cfg.set("test_debugging_ai_runtime", self._selected_ai_runtime().get("key"))
         self.cfg.set("test_debugging_repair_command", self._repair_cmd_var.get().strip())
         self.cfg.set("test_debugging_repair_attempts", self._repair_attempts_var.get().strip() or "2")
         self.cfg.set("test_debugging_require_repair_approval", bool(self._require_repair_approval_var.get()))
@@ -1003,8 +1073,9 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._badge.update_status("ok", "Repair loop settings saved")
 
     def _reset_default_repair_command(self):
-        self._repair_cmd_var.set(self._system.default_repair_command_template())
-        self._badge.update_status("info", "Default Codex repair command restored")
+        runtime = self._selected_ai_runtime()
+        self._repair_cmd_var.set(self._system.default_repair_command_template(runtime["key"]))
+        self._badge.update_status("info", f"Default {runtime['label']} repair command restored")
 
     def _selected_push_policy(self, source="manual"):
         return self._system.normalize_push_policy(
@@ -1078,6 +1149,7 @@ class PanelTestDebugging(ctk.CTkFrame):
             return
 
         approval_mode = self._selected_approval_mode()
+        ai_runtime = self._selected_ai_runtime()
         initial_repo_state = self._system.inspect_repo_state(repo_path)
         self._current_flow_start_state = initial_repo_state
         flow_run_id = str(run_id or "").strip() or self._system.new_automation_run_id(source)
@@ -1116,6 +1188,7 @@ class PanelTestDebugging(ctk.CTkFrame):
                 dict(push_targets),
                 dict(initial_repo_state or {}),
                 self._selected_push_policy(source=source),
+                dict(ai_runtime),
                 str(source or "manual"),
                 flow_run_id,
             ),
@@ -1123,7 +1196,7 @@ class PanelTestDebugging(ctk.CTkFrame):
         )
         self._one_click_thread.start()
 
-    def _one_click_flow_worker(self, repo_path, incident, stop_event, approval_mode, push_targets, initial_repo_state, push_policy, source, run_id):
+    def _one_click_flow_worker(self, repo_path, incident, stop_event, approval_mode, push_targets, initial_repo_state, push_policy, ai_runtime, source, run_id):
         analysis = self._system.analyze_repository(repo_path)
         plan = analysis.get("plan") or []
         repair_result = None
@@ -1188,6 +1261,7 @@ class PanelTestDebugging(ctk.CTkFrame):
                     stop_event=stop_event,
                     max_attempts=int(self._repair_attempts_var.get() or "2"),
                     repair_command_template=self._repair_cmd_var.get().strip(),
+                    ai_runtime=(ai_runtime or {}).get("key") or "",
                 )
 
             if repair_result.get("ok") and approval_mode.get("auto_commit"):
@@ -1427,6 +1501,7 @@ class PanelTestDebugging(ctk.CTkFrame):
                 list(self._current_plan),
                 self._stop_event,
                 int(self._repair_attempts_var.get() or "2"),
+                dict(self._selected_ai_runtime()),
                 self._repair_cmd_var.get().strip(),
             ),
             daemon=True,
@@ -1441,6 +1516,7 @@ class PanelTestDebugging(ctk.CTkFrame):
         plan,
         stop_event,
         max_attempts,
+        ai_runtime,
         repair_command_template,
     ):
         def on_event(event):
@@ -1457,6 +1533,7 @@ class PanelTestDebugging(ctk.CTkFrame):
             stop_event=stop_event,
             max_attempts=max_attempts,
             repair_command_template=repair_command_template,
+            ai_runtime=(ai_runtime or {}).get("key") or "",
         )
 
         def _finish():

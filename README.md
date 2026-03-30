@@ -9,7 +9,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![Platform](https://img.shields.io/badge/Platform-Linux-orange?logo=linux&logoColor=white)](https://kernel.org)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-[![Release](https://img.shields.io/badge/Release-v2.0.0-indigo)](https://github.com/guenfils/git-pusher/releases)
+[![Release](https://img.shields.io/badge/Release-v2.1.0-indigo)](https://github.com/guenfils/git-pusher/releases)
 [![Stars](https://img.shields.io/github/stars/guenfils/git-pusher?style=social)](https://github.com/guenfils/git-pusher)
 
 Push, clone, branch, sync, and manage your repositories on **GitHub and GitLab** from a single beautiful desktop app — no terminal required.
@@ -44,7 +44,7 @@ Step-by-step guided workflow to push any project in minutes:
 - **Branch configurator** — first push, re-push to same branch, or new branch for PR/MR
 - **Multi-repo upload** — push multiple projects in one batch operation
 
-### 📁 Repo Manager (20 panels)
+### 📁 Repo Manager (22 panels)
 
 | Category | Features |
 |---|---|
@@ -68,6 +68,8 @@ Step-by-step guided workflow to push any project in minutes:
 | **Diff Viewer** | Syntax-colored diff with stage/unstage/discard actions |
 | **Settings** | Persistent preferences, credentials, gitflow defaults |
 | **Gitflow** | Feature/Release/Hotfix/Bugfix branch automation |
+| **NovaDeploy** | Monitor remote builds, live developer logs, and deployment failures |
+| **Test & Debugging** | Incident inbox, AI repair loop, approvals, safe commit/push, rollback |
 
 ---
 
@@ -100,7 +102,20 @@ cd git-pusher
 ```bash
 git clone https://github.com/guenfils/git-pusher.git
 cd git-pusher
-./run.sh        # auto-installs dependencies and launches
+./doctor.sh          # optional: preflight report
+./bootstrap-dev.sh   # prepares .venv + config dirs
+./run.sh             # boots dev env and launches
+```
+
+### Option 4 — Dev installable build
+
+```bash
+git clone https://github.com/guenfils/git-pusher.git
+cd git-pusher
+./build-dev.sh
+
+# install directly from the repo or from the extracted bundle
+./install-dev.sh
 ```
 
 ### Build standalone binary
@@ -111,6 +126,17 @@ cd git-pusher
 ```
 
 **Requirements:** Python 3.10+, Linux (X11/Wayland)
+
+### Dev environment notes
+
+- `bootstrap-dev.sh` creates a local `.venv` and the `~/.config/git-pusher/` folders used by NovaDeploy monitoring and test debugging.
+- `doctor.sh` runs a reusable preflight check for Python, git, imports, Node, and config paths.
+- `run.sh` now uses the local `.venv` when available instead of installing Python packages blindly into the system interpreter.
+- `build-dev.sh` creates `dist/git-pusher-dev-linux-x86_64.tar.gz`, a source-based dev bundle you can move and install elsewhere.
+- `install-dev.sh` installs a side-by-side launcher named `git-pusher-dev` and uses `~/.config/git-pusher-dev` by default, so it does not overwrite a stable install.
+- The Test & Debugging panel can use local AI runtimes such as `codex` or `claude` if they are installed and already authenticated in your shell session.
+- Git Pusher does not store or send OpenAI/Anthropic AI API keys for this flow. It only shells out to your local `codex` or `claude` CLI session.
+- Optional: set `GIT_PUSHER_CONFIG_ROOT=/some/path` if you want to test with an isolated config directory.
 
 ---
 

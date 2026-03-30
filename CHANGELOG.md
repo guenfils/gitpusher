@@ -5,6 +5,35 @@ All notable changes to Git Pusher are documented here.
 
 ---
 
+## [2.1.0] — 2026-03-30
+
+### Stable release — NovaDeploy, test debugging, and local AI runtimes
+
+#### NovaDeploy
+- Added a dedicated NovaDeploy monitor panel
+- Added near real-time developer log tailing from GitHub Actions
+- Added failed-build incident export for downstream debugging
+
+#### Test & Debugging
+- Added incident inbox and automatic ingest from NovaDeploy failures
+- Added repository analysis and deterministic check-plan generation
+- Added approval queue, automation history, metrics, and debug context
+- Added safe commit, safe push, and rollback flows with safety snapshots
+- Added guarded auto-run and push protections for automated repair workflows
+
+#### Local AI repair loop
+- Added local `codex` runtime support using the authenticated CLI session
+- Added local `claude` runtime support using the authenticated CLI session
+- Clarified in UI and docs that Git Pusher does not store or send AI API keys
+
+#### Dev runtime and packaging
+- Added reusable preflight/bootstrap tooling for dev mode
+- Added `doctor.sh`, `bootstrap-dev.sh`, `build-dev.sh`, `install-dev.sh`, and `uninstall-dev.sh`
+- Updated stable build/install flow to use local `.venv` for packaging
+- Updated release packaging to include NovaDeploy and Test & Debugging panels
+
+---
+
 ## [2.0.0] — 2026-03-22
 
 ### Major release — Full Repo Manager with 20 panels

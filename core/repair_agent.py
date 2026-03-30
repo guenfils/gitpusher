@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Invoke Codex as the automatic repair worker for a failed incident."""
+"""Invoke a local AI CLI as the automatic repair worker for a failed incident."""
 from __future__ import annotations
 
 import argparse
@@ -12,6 +12,7 @@ from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 SYSTEM_GUIDE_PATH = APP_ROOT / "test-debuging-system"
+SUPPORTED_RUNTIMES = {"codex", "claude"}
 
 
 def _load_json(path: Path) -> dict:
@@ -37,6 +38,13 @@ def _trim_text(value: str, max_lines: int = 180, max_chars: int = 18000, tail: b
     if len(text) > max_chars:
         text = text[-max_chars:] if tail else text[:max_chars]
     return text.strip()
+
+
+def _artifact_stem(context_path: Path) -> str:
+    stem = context_path.stem
+    if stem.endswith("-context"):
+        return stem[: -len("-context")]
+    return stem
 
 
 def _format_plan(plan: list[dict]) -> str:
@@ -72,7 +80,7 @@ def _format_analysis(analysis: dict) -> str:
     return "\n".join(lines)
 
 
-def _build_prompt(context: dict, repo_path: Path) -> str:
+def _build_prompt(context: dict, repo_path: Path, runtime_label: str) -> str:
     incident = context.get("incident") or {}
     diagnosis = context.get("diagnosis") or {}
     failed_step = context.get("failedStep") or {}
@@ -84,6 +92,7 @@ def _build_prompt(context: dict, repo_path: Path) -> str:
 
     prompt = f"""
 You are the automatic repair worker running inside Git Pusher's Test & Debugging loop.
+Current local AI runtime: {runtime_label}
 
 Act like a senior reliability engineer, CI/CD debugger, and careful software repair agent.
 
@@ -199,14 +208,58 @@ def _run_codex(repo_path: Path, prompt: str, model: str, last_message_file: Path
     for line in process.stdout:
         print(line, end="")
 
-    return process.wait()
+    code = process.wait()
+    if last_message_file.exists():
+        return code
+    return code
+
+
+def _run_claude(repo_path: Path, prompt: str, model: str, last_message_file: Path, max_turns: int) -> int:
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        print("claude CLI was not found in PATH.", file=sys.stderr)
+        return 127
+
+    command = [
+        claude_bin,
+        "-p",
+        "--output-format",
+        "text",
+        "--max-turns",
+        str(max(1, int(max_turns or 8))),
+        "--dangerously-skip-permissions",
+        prompt,
+    ]
+    if model:
+        command[1:1] = ["--model", model]
+
+    process = subprocess.Popen(
+        command,
+        cwd=str(repo_path),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    lines = []
+    for line in process.stdout:
+        lines.append(line)
+        print(line, end="")
+    code = process.wait()
+    output = "".join(lines).strip()
+    if output:
+        last_message_file.write_text(output + "\n", encoding="utf-8")
+    return code
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run Codex repair worker for a failed deployment incident.")
+    parser = argparse.ArgumentParser(description="Run a local AI repair worker for a failed deployment incident.")
     parser.add_argument("--repo", required=True, help="Absolute path to the affected local repository.")
     parser.add_argument("--context", required=True, help="Path to the generated repair context JSON.")
-    parser.add_argument("--model", default="", help="Optional Codex model override.")
+    parser.add_argument("--runtime", default="codex", help="Local AI runtime to use: codex or claude.")
+    parser.add_argument("--model", default="", help="Optional model override for the selected local AI runtime.")
+    parser.add_argument("--max-turns", type=int, default=8, help="Maximum agentic turns for Claude print mode.")
     parser.add_argument("--dry-run", action="store_true", help="Print the generated prompt and exit.")
     args = parser.parse_args()
 
@@ -220,18 +273,31 @@ def main() -> int:
         return 2
 
     context = _load_json(context_path)
-    prompt = _build_prompt(context, repo_path)
+    runtime = str(args.runtime or "codex").strip().lower() or "codex"
+    if runtime not in SUPPORTED_RUNTIMES:
+        print(f"Unsupported runtime: {runtime}", file=sys.stderr)
+        return 2
 
-    prompt_file = context_path.with_name(context_path.stem.replace("-context", "-codex-prompt") + ".md")
+    runtime_label = "ChatGPT / Codex" if runtime == "codex" else "Claude"
+    prompt = _build_prompt(context, repo_path, runtime_label)
+
+    artifact_stem = _artifact_stem(context_path)
+    prompt_file = context_path.with_name(f"{artifact_stem}-ai-prompt.md")
     prompt_file.write_text(prompt, encoding="utf-8")
 
     if args.dry_run:
         print(prompt)
         return 0
 
-    last_message_file = context_path.with_name(
-        context_path.stem.replace("-context", "-codex-last-message") + ".md"
-    )
+    last_message_file = context_path.with_name(f"{artifact_stem}-ai-last-message.md")
+    if runtime == "claude":
+        return _run_claude(
+            repo_path,
+            prompt,
+            args.model.strip(),
+            last_message_file,
+            args.max_turns,
+        )
     return _run_codex(repo_path, prompt, args.model.strip(), last_message_file)
 
 

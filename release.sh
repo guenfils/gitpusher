@@ -2,10 +2,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #  release.sh  —  Build and package Git Pusher for a GitHub/GitLab release
 # ─────────────────────────────────────────────────────────────────────────────
-set -e
+set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 APP="git-pusher"
 RELEASE_DIR="release/v${VERSION}"
 
@@ -64,16 +64,19 @@ echo -e "  ${BOLD}Step 3/4:${RESET} Writing release notes..."
 cat > "${RELEASE_DIR}/RELEASE_NOTES.md" << NOTES
 # Git Pusher v${VERSION}
 
-**The first major release of Git Pusher** — the free, open-source GUI for GitHub & GitLab on Linux.
+**Stable release of Git Pusher** for Linux developers working across GitHub, GitLab, and NovaDeploy.
 
 ## Highlights
 
 - 🚀 6-step push wizard with .gitignore generator, secret scanner, and README generator
-- 📁 20-panel Repo Manager: clone, sync, branches, gitflow, diff viewer, and more
+- 📁 22-panel Repo Manager: clone, sync, branches, gitflow, diff viewer, and more
 - 👥 Multi-account support (multiple GitHub + GitLab instances)
 - ⏰ Scheduled push and Watch Mode (auto-commit on file changes)
 - 🔑 SSH Key Manager — generate and register keys without touching the terminal
 - 🌿 Gitflow automation — feature/release/hotfix/bugfix workflows in one click
+- 🚦 NovaDeploy monitor with live developer logs from GitHub Actions
+- 🧪 Test & Debugging panel with incident inbox, approval queue, metrics, and rollback
+- 🤖 Local AI repair runtimes through your authenticated Codex or Claude CLI session
 
 ## Installation
 
@@ -113,11 +116,10 @@ echo -e "  ${BOLD}Files in ${RELEASE_DIR}/:${RESET}"
 ls -lh "$RELEASE_DIR"
 echo ""
 echo -e "  ${BOLD}Next steps to publish:${RESET}"
-echo "    1. git init (if not done) && git add . && git commit -m 'Initial commit'"
-echo "    2. git remote add origin https://github.com/guenfils/git-pusher.git"
-echo "    3. git push -u origin main"
-echo "    4. git tag v${VERSION} && git push origin v${VERSION}"
-echo "    5. Upload files from ${RELEASE_DIR}/ to the GitHub release page"
+echo "    1. git add . && git commit -m 'Release v${VERSION}'"
+echo "    2. git push origin main"
+echo "    3. git tag v${VERSION} && git push origin v${VERSION}"
+echo "    4. Upload files from ${RELEASE_DIR}/ to the GitHub release page"
 echo ""
 echo -e "  ${DIM}Or use GitHub CLI:${RESET}"
 echo "    gh release create v${VERSION} ${RELEASE_DIR}/* --notes-file ${RELEASE_DIR}/RELEASE_NOTES.md"
