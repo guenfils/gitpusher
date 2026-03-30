@@ -31,9 +31,11 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._current_analysis = None
         self._current_plan = []
         self._current_repair_history = None
+        self._current_repo_state = None
         self._run_thread = None
         self._stop_event = None
         self._repair_thread = None
+        self._commit_thread = None
 
         self._build_ui()
         self._apply_saved_settings()
@@ -288,6 +290,75 @@ class PanelTestDebugging(ctk.CTkFrame):
         )
         self._open_latest_command_log_btn.pack(side="left")
 
+        commit_card = Card(scroll)
+        commit_card.pack(fill="x", pady=(0, PAD_SM))
+        commit_header = ctk.CTkFrame(commit_card, fg_color="transparent")
+        commit_header.pack(fill="x", padx=PAD, pady=(PAD_SM, 6))
+        Label(commit_header, text="Safe Commit", size=13, bold=True).pack(side="left")
+        SecondaryButton(
+            commit_header, text="Refresh Repo State", width=130, height=32, command=self._refresh_repo_state
+        ).pack(side="right")
+
+        self._repo_state_box = LogBox(commit_card, height=170)
+        self._repo_state_box.pack(fill="x", padx=PAD, pady=(0, 8))
+
+        commit_msg_row = ctk.CTkFrame(commit_card, fg_color="transparent")
+        commit_msg_row.pack(fill="x", padx=PAD, pady=(0, 8))
+        Label(commit_msg_row, text="Commit message:", size=12, color=TEXT_DIM).pack(side="left", padx=(0, 8))
+        self._commit_msg_var = ctk.StringVar()
+        self._commit_msg_entry = ctk.CTkEntry(
+            commit_msg_row,
+            textvariable=self._commit_msg_var,
+            fg_color=BG3,
+            border_color=BORDER,
+            text_color=TEXT,
+            corner_radius=8,
+            height=36,
+            font=ctk.CTkFont(family="Inter", size=12),
+        )
+        self._commit_msg_entry.pack(side="left", fill="x", expand=True)
+
+        commit_opts_row = ctk.CTkFrame(commit_card, fg_color="transparent")
+        commit_opts_row.pack(fill="x", padx=PAD, pady=(0, 8))
+        Label(commit_opts_row, text="Push to:", size=12, color=TEXT_DIM).pack(side="left", padx=(0, 8))
+        self._push_github_var = ctk.BooleanVar(
+            value=bool(self.app_state.get("github_token") or self.cfg.get_github_token())
+        )
+        self._push_gitlab_var = ctk.BooleanVar(
+            value=bool(self.app_state.get("gitlab_token") or self.cfg.get_gitlab_token())
+        )
+        ctk.CTkCheckBox(
+            commit_opts_row,
+            text="GitHub",
+            variable=self._push_github_var,
+            fg_color=PRIMARY,
+            hover_color=PRIMARY_H,
+            text_color=TEXT,
+            font=ctk.CTkFont(family="Inter", size=12),
+        ).pack(side="left", padx=(0, PAD_SM))
+        ctk.CTkCheckBox(
+            commit_opts_row,
+            text="GitLab",
+            variable=self._push_gitlab_var,
+            fg_color=PRIMARY,
+            hover_color=PRIMARY_H,
+            text_color=TEXT,
+            font=ctk.CTkFont(family="Inter", size=12),
+        ).pack(side="left")
+
+        commit_btn_row = ctk.CTkFrame(commit_card, fg_color="transparent")
+        commit_btn_row.pack(fill="x", padx=PAD, pady=(0, PAD_SM))
+        self._commit_btn = SecondaryButton(
+            commit_btn_row, text="Commit Fix", width=120, height=36, state="disabled",
+            command=lambda: self._start_safe_commit(push=False)
+        )
+        self._commit_btn.pack(side="left", padx=(0, 8))
+        self._commit_push_btn = PrimaryButton(
+            commit_btn_row, text="Commit + Push", width=140, height=36, state="disabled",
+            command=lambda: self._start_safe_commit(push=True)
+        )
+        self._commit_push_btn.pack(side="left")
+
         self._badge = StatusBadge(scroll, status="pending", text="Select an incident to begin")
         self._badge.pack(anchor="w")
 
@@ -304,6 +375,10 @@ class PanelTestDebugging(ctk.CTkFrame):
             repair_command = self._system.default_repair_command_template()
         self._repair_cmd_var.set(repair_command)
         self._repair_attempts_var.set(str(self.cfg.get("test_debugging_repair_attempts", "2")))
+        self._replace_logbox(self._repair_artifacts_box, "Select an incident to inspect repair artifacts.")
+        self._replace_logbox(self._repo_state_box, "Select and analyze a repository to inspect git state.")
+        self._update_repair_artifact_buttons()
+        self._update_commit_buttons()
 
     # ---------- Incident inbox ----------
 
@@ -375,6 +450,8 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._current_analysis = None
         self._current_plan = []
         self._current_repair_history = None
+        self._current_repo_state = None
+        self._current_repair_history = None
 
         for incident_id, button in self._incident_buttons.items():
             button.configure(
@@ -414,6 +491,7 @@ class PanelTestDebugging(ctk.CTkFrame):
             repair_command = self._system.default_repair_command_template()
         self._repair_cmd_var.set(repair_command)
         self._refresh_repair_history()
+        self._refresh_repo_state()
         self._badge.update_status("info", f"Incident selected: {self._short_id(incident.get('deployment_id'))}")
 
     def _resolve_repo_mapping(self, incident):
@@ -494,6 +572,7 @@ class PanelTestDebugging(ctk.CTkFrame):
                 self._current_plan = plan
                 self._replace_logbox(self._analysis_box, self._system.format_analysis_summary(analysis))
                 self._replace_logbox(self._plan_box, self._system.format_plan(plan))
+                self._refresh_repo_state()
                 if analysis.get("ok"):
                     self._badge.update_status("ok", f"Analysis ready: {len(plan)} step(s) detected")
                 else:
@@ -617,6 +696,7 @@ class PanelTestDebugging(ctk.CTkFrame):
             self._stop_btn.configure(state="disabled")
             self._analyze_btn.configure(state="normal")
             self._refresh_repair_history()
+            self._refresh_repo_state(force_message=True)
             if result.get("ok"):
                 self._badge.update_status("ok", "Repair loop reached green")
             elif result.get("handoff_ready"):
@@ -639,12 +719,14 @@ class PanelTestDebugging(ctk.CTkFrame):
             self._current_repair_history = None
             self._replace_logbox(self._repair_artifacts_box, "Select an incident to inspect repair artifacts.")
             self._update_repair_artifact_buttons()
+            self._suggest_commit_message(force=True)
             return
 
         history = self._system.inspect_repair_history(self._current_incident)
         self._current_repair_history = history
         self._replace_logbox(self._repair_artifacts_box, self._system.format_repair_history(history))
         self._update_repair_artifact_buttons()
+        self._suggest_commit_message(force=False)
 
     def _update_repair_artifact_buttons(self):
         latest = ((self._current_repair_history or {}).get("latest_attempt")) or {}
@@ -661,6 +743,96 @@ class PanelTestDebugging(ctk.CTkFrame):
     def _open_latest_repair_file(self, key):
         latest = ((self._current_repair_history or {}).get("latest_attempt")) or {}
         self._open_path(latest.get(key))
+
+    def _refresh_repo_state(self, force_message=False):
+        repo_path = self._repo_path_var.get().strip()
+        if not repo_path:
+            self._current_repo_state = None
+            self._replace_logbox(self._repo_state_box, "Select or map a repository first.")
+            self._update_commit_buttons()
+            return
+
+        repo_state = self._system.inspect_repo_state(repo_path)
+        self._current_repo_state = repo_state
+        self._replace_logbox(self._repo_state_box, self._system.format_repo_state(repo_state))
+        self._suggest_commit_message(force=force_message)
+        self._update_commit_buttons()
+
+    def _suggest_commit_message(self, force=False):
+        if not self._current_incident:
+            if force:
+                self._commit_msg_var.set("")
+            return
+        if self._commit_msg_var.get().strip() and not force:
+            return
+        suggestion = self._system.build_commit_message(
+            self._current_incident,
+            self._current_repair_history or {},
+        )
+        self._commit_msg_var.set(suggestion)
+
+    def _update_commit_buttons(self):
+        enabled = bool((self._current_repo_state or {}).get("ok") and (self._current_repo_state or {}).get("dirty"))
+        state = "normal" if enabled else "disabled"
+        self._commit_btn.configure(state=state)
+        self._commit_push_btn.configure(state=state)
+
+    def _start_safe_commit(self, push=False):
+        if self._commit_thread and self._commit_thread.is_alive():
+            return
+        repo_path = self._repo_path_var.get().strip()
+        if not repo_path:
+            self._badge.update_status("error", "Select or map a repository first")
+            return
+        if not (self._current_repo_state or {}).get("dirty"):
+            self._badge.update_status("warning", "No local changes to commit")
+            return
+
+        self._run_log.clear()
+        self._run_btn.configure(state="disabled")
+        self._stop_btn.configure(state="disabled")
+        self._analyze_btn.configure(state="disabled")
+        self._commit_btn.configure(state="disabled")
+        self._commit_push_btn.configure(state="disabled")
+        self._badge.update_status("pending", "Running safe commit flow")
+        self._commit_thread = threading.Thread(
+            target=self._safe_commit_worker,
+            args=(repo_path, push),
+            daemon=True,
+        )
+        self._commit_thread.start()
+
+    def _safe_commit_worker(self, repo_path, push):
+        github_token = self.app_state.get("github_token") or self.cfg.get_github_token()
+        gitlab_token = self.app_state.get("gitlab_token") or self.cfg.get_gitlab_token()
+
+        def on_event(event):
+            msg = str(event.get("message") or "").rstrip()
+            if msg:
+                self.after(0, lambda text=msg: self._run_log.append(text))
+
+        result = self._system.safe_commit_and_push(
+            repo_path=repo_path,
+            commit_message=self._commit_msg_var.get().strip(),
+            on_event=on_event,
+            push_github=bool(push and self._push_github_var.get()),
+            push_gitlab=bool(push and self._push_gitlab_var.get()),
+            github_token=github_token,
+            gitlab_token=gitlab_token,
+        )
+
+        def _finish():
+            self._run_btn.configure(state="normal")
+            self._analyze_btn.configure(state="normal")
+            self._refresh_repo_state()
+            if result.get("ok"):
+                self._badge.update_status("ok", "Safe commit flow completed")
+            elif result.get("reason") == "clean":
+                self._badge.update_status("warning", "No changes to commit")
+            else:
+                self._badge.update_status("warning", "Safe commit flow finished with issues")
+
+        self.after(0, _finish)
 
     # ---------- Helpers ----------
 

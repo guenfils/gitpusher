@@ -8,6 +8,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+from core.git_manager import GitManager
 
 MAX_INCIDENTS = 50
 MAX_PLAN_STEPS = 12
@@ -58,6 +59,7 @@ SCRIPT_CATEGORIES = {
 class TestDebugSystem:
     def __init__(self):
         self._active_process = None
+        self._git = GitManager()
 
     def default_repair_command_template(self):
         return DEFAULT_REPAIR_COMMAND_TEMPLATE
@@ -301,6 +303,90 @@ class TestDebugSystem:
             "root_scripts": sorted((root_manifest or {}).get("scripts", {}).keys()),
             "plan": plan,
         }
+
+    def inspect_repo_state(self, repo_path):
+        root = Path(repo_path).expanduser()
+        if not root.exists():
+            return {"ok": False, "error": "Repository path does not exist."}
+        if not self._git.is_git_repo(str(root)):
+            return {"ok": False, "error": "Repository path is not a git repository."}
+
+        branch = self._git.get_current_branch(str(root)) or "unknown"
+        remote_url = self._git.get_remote_url(str(root), "origin")
+        last_commit = self._git.get_last_commit(str(root)) or {}
+        status_text = self._git.get_status(str(root))
+        status_lines = [line for line in status_text.splitlines() if line.strip()]
+        changed_files = self._git.get_changed_files(str(root))
+        untracked = [
+            line[3:].strip()
+            for line in status_lines
+            if line.startswith("?? ")
+        ]
+        return {
+            "ok": True,
+            "repo_path": str(root),
+            "branch": branch,
+            "remote_url": remote_url,
+            "last_commit": last_commit,
+            "status_lines": status_lines,
+            "changed_files": changed_files,
+            "untracked_files": untracked,
+            "dirty": bool(status_lines),
+        }
+
+    def build_commit_message(self, incident, repair_history):
+        latest = ((repair_history or {}).get("latest_attempt")) or {}
+        diagnosis = str(latest.get("diagnosis_category") or "").strip()
+        failed_step = str(latest.get("failed_step_name") or "").strip()
+        summary = self.strip_log_tags(str((incident or {}).get("summary") or "").strip())
+        summary = " ".join(summary.split())
+        if diagnosis and failed_step:
+            return f"Fix NovaDeploy {diagnosis} failure in {failed_step}"
+        if diagnosis:
+            return f"Fix NovaDeploy {diagnosis} failure"
+        if summary:
+            clipped = summary[:56].rstrip()
+            if len(summary) > 56:
+                clipped += "..."
+            return f"Fix NovaDeploy failure: {clipped}"
+        return "Fix NovaDeploy deployment failure"
+
+    def format_repo_state(self, repo_state):
+        if not repo_state.get("ok"):
+            return repo_state.get("error", "Repository state unavailable.")
+
+        lines = [
+            f"Repo: {repo_state.get('repo_path')}",
+            f"Branch: {repo_state.get('branch')}",
+            f"Dirty: {'yes' if repo_state.get('dirty') else 'no'}",
+        ]
+        remote_url = str(repo_state.get("remote_url") or "").strip()
+        if remote_url:
+            lines.append(f"Origin: {remote_url}")
+        last_commit = repo_state.get("last_commit") or {}
+        if last_commit:
+            lines.append(
+                "HEAD: "
+                f"{last_commit.get('hash') or 'unknown'} | "
+                f"{last_commit.get('message') or 'No message'}"
+            )
+        changed_files = repo_state.get("changed_files") or []
+        untracked_files = repo_state.get("untracked_files") or []
+        status_lines = repo_state.get("status_lines") or []
+        lines.append(f"Status entries: {len(status_lines)}")
+        if changed_files:
+            lines.append("")
+            lines.append("Changed files:")
+            for item in changed_files[:12]:
+                lines.append(
+                    f"{item.get('file')}  (+{item.get('added') or 0} / -{item.get('removed') or 0})"
+                )
+        elif untracked_files:
+            lines.append("")
+            lines.append("Untracked files:")
+            for item in untracked_files[:12]:
+                lines.append(item)
+        return "\n".join(lines)
 
     def _detect_package_manager(self, root):
         if (root / "pnpm-lock.yaml").exists() or (root / "pnpm-workspace.yaml").exists():
@@ -596,6 +682,7 @@ class TestDebugSystem:
         repair_dir = Path(incident.get("deployment_dir") or root / ".git-pusher-repair")
         repair_dir = repair_dir / "repair-loop"
         repair_dir.mkdir(parents=True, exist_ok=True)
+        repo_state_before = self.inspect_repo_state(root)
 
         snapshot = self.create_safety_snapshot(root, label="test-debug")
         if snapshot.get("ok"):
@@ -656,6 +743,7 @@ class TestDebugSystem:
                 analysis=analysis,
                 plan=plan,
                 snapshot=snapshot,
+                repo_state_before=repo_state_before,
                 attempt=attempt,
                 results=result.get("results") or [],
                 failed_step=failed_step,
@@ -798,6 +886,97 @@ class TestDebugSystem:
             }
         return {"ok": True, "branch": branch, "tag": tag, "head": head}
 
+    def safe_commit_and_push(
+        self,
+        repo_path,
+        commit_message,
+        on_event,
+        push_github=False,
+        push_gitlab=False,
+        github_token="",
+        gitlab_token="",
+    ):
+        root = Path(repo_path).expanduser()
+        repo_state = self.inspect_repo_state(root)
+        if not repo_state.get("ok"):
+            on_event({"type": "safe_commit_error", "message": repo_state.get("error", "Repository state unavailable.")})
+            return {"ok": False, "repo_state": repo_state}
+        if not repo_state.get("dirty"):
+            on_event({"type": "safe_commit_skipped", "message": "No local changes detected. Nothing to commit."})
+            return {"ok": False, "repo_state": repo_state, "reason": "clean"}
+
+        snapshot = self.create_safety_snapshot(root, label="safe-commit")
+        if snapshot.get("ok"):
+            on_event(
+                {
+                    "type": "safe_commit_snapshot",
+                    "message": f"Pre-commit snapshot created: {snapshot['branch']} | {snapshot['tag']}",
+                    "snapshot": snapshot,
+                }
+            )
+        else:
+            on_event(
+                {
+                    "type": "safe_commit_snapshot_skipped",
+                    "message": f"Pre-commit snapshot skipped: {snapshot.get('reason')}",
+                    "snapshot": snapshot,
+                }
+            )
+
+        on_event({"type": "safe_commit_stage", "message": "Staging repository changes..."})
+        ok_add, out_add = self._git.add_all(str(root))
+        if out_add.strip():
+            on_event({"type": "safe_commit_stage_output", "message": out_add.strip()})
+        if not ok_add:
+            on_event({"type": "safe_commit_error", "message": "Failed to stage repository changes."})
+            return {"ok": False, "snapshot": snapshot, "repo_state": repo_state}
+
+        message = str(commit_message or "").strip() or "Fix NovaDeploy deployment failure"
+        on_event({"type": "safe_commit_commit", "message": f"Creating commit: {message}"})
+        ok_commit, out_commit = self._git.commit(str(root), message)
+        if out_commit.strip():
+            on_event({"type": "safe_commit_commit_output", "message": out_commit.strip()})
+        if not ok_commit:
+            on_event({"type": "safe_commit_error", "message": "Commit failed."})
+            return {"ok": False, "snapshot": snapshot, "repo_state": repo_state}
+
+        branch = self._git.get_current_branch(str(root)) or "main"
+        push_results = []
+        any_push_ok = False
+
+        if push_github:
+            env = {"GIT_ASKPASS": "echo", "GIT_USERNAME": "x-token", "GIT_PASSWORD": github_token} if github_token else None
+            ok_push, out_push = self._git.push(str(root), "origin", branch, env=env)
+            if out_push.strip():
+                on_event({"type": "safe_push_output", "message": f"GitHub: {out_push.strip()}"})
+            push_results.append({"target": "github", "ok": ok_push})
+            any_push_ok = any_push_ok or ok_push
+
+        if push_gitlab:
+            env = {"GIT_ASKPASS": "echo", "GIT_USERNAME": "oauth2", "GIT_PASSWORD": gitlab_token} if gitlab_token else None
+            ok_push, out_push = self._git.push(str(root), "gitlab", branch, env=env)
+            if out_push.strip():
+                on_event({"type": "safe_push_output", "message": f"GitLab: {out_push.strip()}"})
+            push_results.append({"target": "gitlab", "ok": ok_push})
+            any_push_ok = any_push_ok or ok_push
+
+        if push_results:
+            if all(item["ok"] for item in push_results):
+                on_event({"type": "safe_push_done", "message": "Push completed successfully."})
+            elif any_push_ok:
+                on_event({"type": "safe_push_partial", "message": "Push completed only partially."})
+            else:
+                on_event({"type": "safe_push_failed", "message": "Push failed."})
+
+        return {
+            "ok": ok_commit and (not push_results or any(item["ok"] for item in push_results)),
+            "snapshot": snapshot,
+            "repo_state": repo_state,
+            "commit_message": message,
+            "branch": branch,
+            "push_results": push_results,
+        }
+
     def _run_streaming_command(self, repo_path, command, on_output, stop_event=None):
         process = subprocess.Popen(
             ["bash", "-lc", command],
@@ -839,6 +1018,7 @@ class TestDebugSystem:
         analysis,
         plan,
         snapshot,
+        repo_state_before,
         attempt,
         results,
         failed_step,
@@ -866,6 +1046,7 @@ class TestDebugSystem:
             "analysis": analysis,
             "plan": plan,
             "snapshot": snapshot,
+            "repoStateBefore": repo_state_before,
             "failedStep": failed_step,
             "results": results,
             "diagnosis": diagnosis,
