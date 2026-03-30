@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -92,6 +93,7 @@ class TestDebugSystem:
     def __init__(self):
         self._active_process = None
         self._git = GitManager()
+        self._node_runtime = self._discover_node_runtime()
 
     def default_repair_command_template(self):
         return DEFAULT_REPAIR_COMMAND_TEMPLATE
@@ -109,6 +111,105 @@ class TestDebugSystem:
         mode = dict(APPROVAL_MODES[key])
         mode["key"] = key
         return mode
+
+    def _discover_node_runtime(self):
+        system_node = shutil.which("node")
+        system_npm = shutil.which("npm")
+        if system_node and system_npm:
+            version = self._safe_capture([system_node, "-v"])
+            npm_version = self._safe_capture([system_npm, "-v"])
+            return {
+                "source": "system-path",
+                "bin_dir": str(Path(system_node).resolve().parent),
+                "node": system_node,
+                "npm": system_npm,
+                "node_version": version,
+                "npm_version": npm_version,
+            }
+
+        candidates = []
+        nvm_bin = str(os.environ.get("NVM_BIN") or "").strip()
+        if nvm_bin:
+            candidates.append(Path(nvm_bin))
+
+        nvm_root = Path(os.environ.get("NVM_DIR") or (Path.home() / ".nvm"))
+        versions_root = nvm_root / "versions" / "node"
+        if versions_root.exists():
+            version_dirs = [path for path in versions_root.iterdir() if path.is_dir() and path.name.startswith("v")]
+            version_dirs.sort(key=self._node_version_sort_key, reverse=True)
+            preferred = [path for path in version_dirs if path.name.startswith("v20.")]
+            fallback = [path for path in version_dirs if path not in preferred]
+            for path in preferred + fallback:
+                candidates.append(path / "bin")
+
+        seen = set()
+        for bin_dir in candidates:
+            bin_dir = Path(bin_dir).expanduser()
+            if not bin_dir.exists():
+                continue
+            node_path = bin_dir / "node"
+            npm_path = bin_dir / "npm"
+            key = str(bin_dir.resolve())
+            if key in seen or not node_path.exists() or not npm_path.exists():
+                continue
+            seen.add(key)
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+            version = self._safe_capture([str(node_path), "-v"], env=env)
+            npm_version = self._safe_capture([str(npm_path), "-v"], env=env)
+            if version:
+                return {
+                    "source": "nvm",
+                    "bin_dir": str(bin_dir),
+                    "node": str(node_path),
+                    "npm": str(npm_path),
+                    "node_version": version,
+                    "npm_version": npm_version,
+                }
+
+        return {
+            "source": "missing",
+            "bin_dir": "",
+            "node": "",
+            "npm": "",
+            "node_version": "",
+            "npm_version": "",
+        }
+
+    def _node_version_sort_key(self, path):
+        name = str(getattr(path, "name", path)).lstrip("v")
+        parts = []
+        for chunk in name.split("."):
+            try:
+                parts.append(int(chunk))
+            except ValueError:
+                parts.append(-1)
+        return tuple(parts)
+
+    def _safe_capture(self, cmd, env=None):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        except Exception:
+            return ""
+        if result.returncode != 0:
+            return ""
+        return str(result.stdout or "").strip()
+
+    def _command_env(self):
+        env = os.environ.copy()
+        bin_dir = str((self._node_runtime or {}).get("bin_dir") or "").strip()
+        if bin_dir:
+            env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+        return env
+
+    def node_runtime_summary(self):
+        runtime = self._node_runtime or {}
+        source = runtime.get("source") or "missing"
+        version = runtime.get("node_version") or "unavailable"
+        npm_version = runtime.get("npm_version") or "unavailable"
+        if source == "missing":
+            return "missing"
+        return f"{version} / npm {npm_version} ({source})"
 
     # ---------- Incidents ----------
 
@@ -340,6 +441,7 @@ class TestDebugSystem:
             "repo_name": root.name,
             "is_git_repo": (root / ".git").exists(),
             "package_manager": package_manager,
+            "node_runtime": self.node_runtime_summary(),
             "architecture": architecture,
             "languages": languages,
             "frameworks": frameworks,
@@ -1271,6 +1373,7 @@ class TestDebugSystem:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=self._command_env(),
         )
         self._active_process = process
         lines = []
@@ -1477,6 +1580,7 @@ class TestDebugSystem:
             f"Repository: {analysis.get('repo_name')}",
             f"Architecture: {analysis.get('architecture')}",
             f"Package manager: {analysis.get('package_manager')}",
+            f"Node runtime: {analysis.get('node_runtime') or 'missing'}",
             f"Languages: {', '.join(analysis.get('languages') or ['Unknown'])}",
             f"Frameworks: {', '.join(analysis.get('frameworks') or ['Unknown'])}",
             f"Git repo: {'yes' if analysis.get('is_git_repo') else 'no'}",
