@@ -411,6 +411,7 @@ class PanelNovaDeploy(ctk.CTkFrame):
             exported += 1
             self._stats["exports"] += 1
             self._stats["last_deployment"] = self._short_id(deployment_id)
+            self._queue_test_debugging_incident(deployment, result)
             self._log(
                 f"Exported failed build {deployment_id} -> {result['log_path'].name} | {result['summary']}"
             )
@@ -502,6 +503,24 @@ class PanelNovaDeploy(ctk.CTkFrame):
             "summary_path": summary_path,
             "summary": summary,
         }
+
+    def _queue_test_debugging_incident(self, deployment, stored):
+        project_id = str(deployment.get("projectId") or "unknown-project").strip()
+        deployment_id = str(deployment.get("id") or "unknown").strip()
+        json_path = Path(stored["json_path"])
+        incident_id = f"{project_id}:{deployment_id}:{json_path.name}"
+        self.cfg.set(
+            "test_debugging_pending_incident",
+            {
+                "incident_id": incident_id,
+                "project_id": project_id,
+                "deployment_id": deployment_id,
+                "deployment_dir": str(json_path.parent),
+                "json_path": str(json_path),
+                "summary": str(stored.get("summary") or "").strip(),
+                "queued_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
     def _render_log_text(self, logs):
         rendered = []

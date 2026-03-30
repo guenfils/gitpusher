@@ -26,20 +26,33 @@ class PanelTestDebugging(ctk.CTkFrame):
         self.app_state = app_state
         self.cfg = ConfigManager()
         self._system = TestDebugSystem()
+        self._approval_mode_label_to_key = {
+            label: key for key, label in self._system.approval_mode_choices()
+        }
+        self._approval_mode_key_to_label = {
+            key: label for key, label in self._system.approval_mode_choices()
+        }
+        self._current_approval_mode = self._system.get_approval_mode()
         self._incident_buttons = {}
         self._current_incident = None
         self._current_analysis = None
         self._current_plan = []
         self._current_repair_history = None
         self._current_repo_state = None
+        self._current_rollback_target = None
+        self._current_gate_state = None
         self._run_thread = None
         self._stop_event = None
         self._repair_thread = None
         self._commit_thread = None
+        self._rollback_thread = None
+        self._one_click_thread = None
+        self._auto_ingest_job = None
 
         self._build_ui()
         self._apply_saved_settings()
         self._refresh_incidents()
+        self._schedule_auto_ingest()
 
     def _build_ui(self):
         scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
@@ -85,6 +98,39 @@ class PanelTestDebugging(ctk.CTkFrame):
 
         self._incident_count_lbl = Label(source_card, text="", size=11, color=TEXT_DIM)
         self._incident_count_lbl.pack(anchor="w", padx=PAD, pady=(0, PAD_SM))
+        auto_row = ctk.CTkFrame(source_card, fg_color="transparent")
+        auto_row.pack(fill="x", padx=PAD, pady=(0, 6))
+        self._auto_ingest_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            auto_row,
+            text="Auto-ingest new failed incidents from NovaDeploy monitor",
+            variable=self._auto_ingest_var,
+            fg_color=PRIMARY,
+            hover_color=PRIMARY_H,
+            text_color=TEXT,
+            font=ctk.CTkFont(family="Inter", size=12),
+            command=self._save_auto_ingest_setting,
+        ).pack(side="left")
+        auto_run_row = ctk.CTkFrame(source_card, fg_color="transparent")
+        auto_run_row.pack(fill="x", padx=PAD, pady=(0, PAD_SM))
+        self._auto_run_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            auto_run_row,
+            text="Auto-run approval flow for new failed incidents",
+            variable=self._auto_run_var,
+            fg_color=PRIMARY,
+            hover_color=PRIMARY_H,
+            text_color=TEXT,
+            font=ctk.CTkFont(family="Inter", size=12),
+            command=self._save_auto_run_setting,
+        ).pack(side="left")
+        self._auto_run_hint = Label(
+            source_card,
+            text="Uses the current approval mode and only runs when a repo map already exists.",
+            size=11,
+            color=TEXT_DIM,
+        )
+        self._auto_run_hint.pack(anchor="w", padx=PAD, pady=(0, PAD_SM))
 
         inbox_card = Card(scroll)
         inbox_card.pack(fill="x", pady=(0, PAD_SM))
@@ -208,6 +254,32 @@ class PanelTestDebugging(ctk.CTkFrame):
             color=TEXT_DIM,
         ).pack(anchor="w", padx=PAD, pady=(0, 6))
 
+        approval_row = ctk.CTkFrame(repair_card, fg_color="transparent")
+        approval_row.pack(fill="x", padx=PAD, pady=(0, 8))
+        Label(approval_row, text="Approval mode:", size=12, color=TEXT_DIM).pack(side="left", padx=(0, 8))
+        self._approval_mode_var = ctk.StringVar(
+            value=self._approval_mode_key_to_label.get(
+                self._system.default_approval_mode(),
+                next(iter(self._approval_mode_label_to_key), "Repair Only"),
+            )
+        )
+        self._approval_mode_segment = ctk.CTkSegmentedButton(
+            approval_row,
+            values=list(self._approval_mode_label_to_key.keys()),
+            variable=self._approval_mode_var,
+            fg_color=BG3,
+            selected_color=PRIMARY,
+            selected_hover_color=PRIMARY_H,
+            unselected_color=BG3,
+            unselected_hover_color=BORDER,
+            text_color=TEXT,
+            font=ctk.CTkFont(family="Inter", size=11),
+            command=lambda _value: self._save_approval_mode_setting(),
+        )
+        self._approval_mode_segment.pack(side="left", fill="x", expand=True)
+        self._approval_mode_hint = Label(repair_card, text="", size=11, color=TEXT_DIM)
+        self._approval_mode_hint.pack(anchor="w", padx=PAD, pady=(0, 8))
+
         repair_cmd_row = ctk.CTkFrame(repair_card, fg_color="transparent")
         repair_cmd_row.pack(fill="x", padx=PAD, pady=(0, 8))
         self._repair_cmd_var = ctk.StringVar()
@@ -248,6 +320,10 @@ class PanelTestDebugging(ctk.CTkFrame):
             text_color=TEXT,
             font=ctk.CTkFont(family="Inter", size=12),
         ).pack(side="left", padx=(0, PAD_SM))
+        self._one_click_btn = SecondaryButton(
+            repair_opts_row, text="Analyze + Repair", width=190, height=36, command=self._start_one_click_flow
+        )
+        self._one_click_btn.pack(side="left", padx=(0, 8))
         PrimaryButton(
             repair_opts_row, text="Start Repair Loop", width=160, height=36, command=self._start_repair_loop
         ).pack(side="left", padx=(0, 8))
@@ -289,6 +365,16 @@ class PanelTestDebugging(ctk.CTkFrame):
             command=lambda: self._open_latest_repair_file("command_log_file")
         )
         self._open_latest_command_log_btn.pack(side="left")
+
+        gate_card = Card(scroll)
+        gate_card.pack(fill="x", pady=(0, PAD_SM))
+        gate_header = ctk.CTkFrame(gate_card, fg_color="transparent")
+        gate_header.pack(fill="x", padx=PAD, pady=(PAD_SM, 6))
+        Label(gate_header, text="Safety Gate", size=13, bold=True).pack(side="left")
+        self._gate_badge = StatusBadge(gate_header, status="pending", text="Gate pending")
+        self._gate_badge.pack(side="right")
+        self._gate_box = LogBox(gate_card, height=140)
+        self._gate_box.pack(fill="x", padx=PAD, pady=(0, PAD_SM))
 
         commit_card = Card(scroll)
         commit_card.pack(fill="x", pady=(0, PAD_SM))
@@ -359,6 +445,19 @@ class PanelTestDebugging(ctk.CTkFrame):
         )
         self._commit_push_btn.pack(side="left")
 
+        rollback_btn_row = ctk.CTkFrame(commit_card, fg_color="transparent")
+        rollback_btn_row.pack(fill="x", padx=PAD, pady=(0, PAD_SM))
+        self._rollback_btn = SecondaryButton(
+            rollback_btn_row, text="Rollback", width=120, height=36, state="disabled",
+            command=lambda: self._start_rollback(push=False)
+        )
+        self._rollback_btn.pack(side="left", padx=(0, 8))
+        self._rollback_push_btn = PrimaryButton(
+            rollback_btn_row, text="Rollback + Push", width=150, height=36, state="disabled",
+            command=lambda: self._start_rollback(push=True)
+        )
+        self._rollback_push_btn.pack(side="left")
+
         self._badge = StatusBadge(scroll, status="pending", text="Select an incident to begin")
         self._badge.pack(anchor="w")
 
@@ -375,10 +474,22 @@ class PanelTestDebugging(ctk.CTkFrame):
             repair_command = self._system.default_repair_command_template()
         self._repair_cmd_var.set(repair_command)
         self._repair_attempts_var.set(str(self.cfg.get("test_debugging_repair_attempts", "2")))
+        self._auto_ingest_var.set(bool(self.cfg.get("test_debugging_auto_ingest", True)))
+        self._auto_run_var.set(bool(self.cfg.get("test_debugging_auto_run", False)))
+        approval_mode = self._system.get_approval_mode(
+            self.cfg.get("test_debugging_approval_mode", self._system.default_approval_mode())
+        )
+        self._approval_mode_var.set(
+            self._approval_mode_key_to_label.get(approval_mode["key"], approval_mode["label"])
+        )
         self._replace_logbox(self._repair_artifacts_box, "Select an incident to inspect repair artifacts.")
+        self._replace_logbox(self._gate_box, "Run validation to evaluate required checks.")
         self._replace_logbox(self._repo_state_box, "Select and analyze a repository to inspect git state.")
+        self._apply_approval_mode_ui(approval_mode)
         self._update_repair_artifact_buttons()
+        self._reset_safety_gate()
         self._update_commit_buttons()
+        self._update_rollback_buttons()
 
     # ---------- Incident inbox ----------
 
@@ -390,7 +501,46 @@ class PanelTestDebugging(ctk.CTkFrame):
         self.cfg.set("test_debugging_incident_root", folder)
         self._refresh_incidents()
 
-    def _refresh_incidents(self):
+    def _save_auto_ingest_setting(self):
+        enabled = bool(self._auto_ingest_var.get())
+        self.cfg.set("test_debugging_auto_ingest", enabled)
+        if not enabled and self._auto_run_var.get():
+            self._auto_run_var.set(False)
+            self.cfg.set("test_debugging_auto_run", False)
+            self._badge.update_status("warning", "Auto-run disabled because auto-ingest was turned off")
+
+    def _save_auto_run_setting(self):
+        enabled = bool(self._auto_run_var.get())
+        if enabled and not self._auto_ingest_var.get():
+            self._auto_ingest_var.set(True)
+            self.cfg.set("test_debugging_auto_ingest", True)
+        self.cfg.set("test_debugging_auto_run", enabled)
+
+    def _selected_approval_mode(self):
+        label = str(self._approval_mode_var.get() or "").strip()
+        key = self._approval_mode_label_to_key.get(label, self._system.default_approval_mode())
+        return self._system.get_approval_mode(key)
+
+    def _apply_approval_mode_ui(self, mode=None):
+        mode = mode or self._selected_approval_mode()
+        self._current_approval_mode = mode
+        self._approval_mode_hint.configure(text=mode["description"])
+        button_label = {
+            "analyze_only": "Analyze",
+            "repair_only": "Analyze + Repair",
+            "repair_commit": "Analyze + Repair + Commit",
+            "repair_push": "Analyze + Repair + Push",
+        }.get(mode["key"], mode["label"])
+        self._one_click_btn.configure(text=button_label)
+
+    def _save_approval_mode_setting(self, notify=True):
+        mode = self._selected_approval_mode()
+        self.cfg.set("test_debugging_approval_mode", mode["key"])
+        self._apply_approval_mode_ui(mode)
+        if notify:
+            self._badge.update_status("ok", f"Approval mode set to {mode['label']}")
+
+    def _refresh_incidents(self, auto=False):
         root_dir = self._incident_root_var.get().strip()
         incidents = self._system.list_incidents(root_dir)
         self._render_incident_list(incidents)
@@ -398,8 +548,83 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._incident_count_lbl.configure(
             text=f"{count} failed incident{'s' if count != 1 else ''} found in {root_dir}"
         )
+        self._consume_pending_incident(incidents, auto=auto)
         if count == 0:
             self._badge.update_status("warning", "No failed incidents found yet")
+
+    def _schedule_auto_ingest(self):
+        if self._auto_ingest_job is not None:
+            try:
+                self.after_cancel(self._auto_ingest_job)
+            except Exception:
+                pass
+        self._auto_ingest_job = self.after(5000, self._auto_ingest_tick)
+
+    def _auto_ingest_tick(self):
+        self._auto_ingest_job = None
+        if not self.winfo_exists():
+            return
+        if self._auto_ingest_var.get():
+            self._refresh_incidents(auto=True)
+        self._schedule_auto_ingest()
+
+    def _consume_pending_incident(self, incidents, auto=False):
+        pending = self.cfg.get("test_debugging_pending_incident", {}) or {}
+        if not pending or not self._auto_ingest_var.get():
+            return
+        if self._is_busy():
+            return
+
+        pending_id = str(pending.get("incident_id") or "").strip()
+        pending_json = str(pending.get("json_path") or "").strip()
+        pending_deployment_dir = str(pending.get("deployment_dir") or "").strip()
+        matched = None
+        for incident in incidents:
+            if pending_id and incident.get("id") == pending_id:
+                matched = incident
+                break
+            if pending_json and incident.get("payload_path") == pending_json:
+                matched = incident
+                break
+            if pending_deployment_dir and incident.get("deployment_dir") == pending_deployment_dir:
+                matched = incident
+                break
+
+        if not matched:
+            return
+
+        if not self._current_incident or self._current_incident.get("id") != matched.get("id"):
+            self._select_incident(matched)
+            if auto:
+                self._badge.update_status("info", f"Auto-ingested incident: {self._short_id(matched.get('deployment_id'))}")
+        self.cfg.delete("test_debugging_pending_incident")
+        if auto:
+            self._schedule_auto_run(matched)
+
+    def _schedule_auto_run(self, incident):
+        if not self._auto_run_var.get():
+            return
+        incident_id = str((incident or {}).get("id") or "").strip()
+        if not incident_id:
+            return
+        self.after(250, lambda value=incident_id: self._auto_run_selected_incident(value))
+
+    def _auto_run_selected_incident(self, incident_id):
+        if not self.winfo_exists():
+            return
+        if not self._auto_run_var.get() or self._is_busy():
+            return
+        current = self._current_incident or {}
+        if str(current.get("id") or "").strip() != str(incident_id or "").strip():
+            return
+        repo_path = self._repo_path_var.get().strip()
+        if not repo_path:
+            self._badge.update_status("warning", "Auto-run skipped: save a repository map for this project first")
+            return
+        mode = self._selected_approval_mode()
+        self._run_log.append(f"[auto-run] Starting {mode['label']} for {self._short_id(current.get('deployment_id'))}")
+        self._badge.update_status("pending", f"Auto-running {mode['label']}")
+        self._start_one_click_flow()
 
     def _render_incident_list(self, incidents):
         for widget in self._incident_list.winfo_children():
@@ -434,7 +659,7 @@ class PanelTestDebugging(ctk.CTkFrame):
         if self._current_incident:
             for incident in incidents:
                 if incident["id"] == self._current_incident["id"]:
-                    self._select_incident(incident)
+                    self._current_incident = incident
                     return
         self._select_incident(incidents[0])
 
@@ -451,7 +676,8 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._current_plan = []
         self._current_repair_history = None
         self._current_repo_state = None
-        self._current_repair_history = None
+        self._current_rollback_target = None
+        self._reset_safety_gate()
 
         for incident_id, button in self._incident_buttons.items():
             button.configure(
@@ -572,6 +798,7 @@ class PanelTestDebugging(ctk.CTkFrame):
                 self._current_plan = plan
                 self._replace_logbox(self._analysis_box, self._system.format_analysis_summary(analysis))
                 self._replace_logbox(self._plan_box, self._system.format_plan(plan))
+                self._reset_safety_gate()
                 self._refresh_repo_state()
                 if analysis.get("ok"):
                     self._badge.update_status("ok", f"Analysis ready: {len(plan)} step(s) detected")
@@ -582,6 +809,137 @@ class PanelTestDebugging(ctk.CTkFrame):
             self.after(0, _finish)
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _start_one_click_flow(self):
+        if not self._current_incident:
+            self._badge.update_status("error", "Select an incident first")
+            return
+        if self._is_busy():
+            return
+        if self._one_click_thread and self._one_click_thread.is_alive():
+            return
+
+        repo_path = self._repo_path_var.get().strip()
+        if not repo_path:
+            self._badge.update_status("error", "Select or map a repository first")
+            return
+
+        approval_mode = self._selected_approval_mode()
+        push_targets = {
+            "github": bool(self._push_github_var.get()),
+            "gitlab": bool(self._push_gitlab_var.get()),
+        }
+        self._save_repair_settings()
+        self._run_log.clear()
+        self._stop_event = threading.Event()
+        self._run_btn.configure(state="disabled")
+        self._stop_btn.configure(state="normal")
+        self._analyze_btn.configure(state="disabled")
+        self._one_click_btn.configure(state="disabled")
+        self._commit_btn.configure(state="disabled")
+        self._commit_push_btn.configure(state="disabled")
+        self._rollback_btn.configure(state="disabled")
+        self._rollback_push_btn.configure(state="disabled")
+        self._badge.update_status("pending", f"Running {approval_mode['label']} flow")
+        self._one_click_thread = threading.Thread(
+            target=self._one_click_flow_worker,
+            args=(repo_path, dict(self._current_incident), self._stop_event, dict(approval_mode), dict(push_targets)),
+            daemon=True,
+        )
+        self._one_click_thread.start()
+
+    def _one_click_flow_worker(self, repo_path, incident, stop_event, approval_mode, push_targets):
+        analysis = self._system.analyze_repository(repo_path)
+        plan = analysis.get("plan") or []
+        repair_result = None
+        commit_result = None
+        commit_warning = ""
+
+        def _apply_analysis():
+            self._current_analysis = analysis
+            self._current_plan = plan
+            self._replace_logbox(self._analysis_box, self._system.format_analysis_summary(analysis))
+            self._replace_logbox(self._plan_box, self._system.format_plan(plan))
+            self._reset_safety_gate()
+            self._refresh_repo_state()
+
+        self.after(0, _apply_analysis)
+        if not analysis.get("ok") or not plan:
+            def _finish_failed():
+                self._run_btn.configure(state="normal")
+                self._stop_btn.configure(state="disabled")
+                self._analyze_btn.configure(state="normal")
+                self._one_click_btn.configure(state="normal")
+                self._update_commit_buttons()
+                self._update_rollback_buttons()
+                self._badge.update_status("error", analysis.get("error", f"{approval_mode['label']} could not start"))
+            self.after(0, _finish_failed)
+            return
+
+        def on_event(event):
+            msg = str(event.get("message") or "").rstrip()
+            if msg:
+                self.after(0, lambda text=msg: self._run_log.append(text))
+
+        if approval_mode.get("auto_repair"):
+            repair_result = self._system.start_repair_loop(
+                repo_path=repo_path,
+                incident=incident,
+                analysis=analysis,
+                plan=plan,
+                on_event=on_event,
+                stop_event=stop_event,
+                max_attempts=int(self._repair_attempts_var.get() or "2"),
+                repair_command_template=self._repair_cmd_var.get().strip(),
+            )
+
+            if repair_result.get("ok") and approval_mode.get("auto_commit"):
+                repair_history = self._system.inspect_repair_history(incident)
+                commit_message = self._system.build_commit_message(incident, repair_history or {})
+                if approval_mode.get("auto_push") and not any(push_targets.values()):
+                    commit_warning = "Push mode selected, but no remotes are enabled. Commit will stay local."
+                    on_event({"type": "approval_push_warning", "message": commit_warning})
+                commit_result = self._system.safe_commit_and_push(
+                    repo_path=repo_path,
+                    commit_message=commit_message,
+                    on_event=on_event,
+                    push_github=bool(approval_mode.get("auto_push") and push_targets.get("github")),
+                    push_gitlab=bool(approval_mode.get("auto_push") and push_targets.get("gitlab")),
+                    github_token=self.app_state.get("github_token") or self.cfg.get_github_token(),
+                    gitlab_token=self.app_state.get("gitlab_token") or self.cfg.get_gitlab_token(),
+                )
+
+        def _finish():
+            self._run_btn.configure(state="normal")
+            self._stop_btn.configure(state="disabled")
+            self._analyze_btn.configure(state="normal")
+            self._one_click_btn.configure(state="normal")
+            self._refresh_repair_history()
+            if repair_result is not None:
+                self._apply_safety_gate(repair_result.get("results") or [], repair_result.get("ok"), executed=True)
+            self._refresh_repo_state(force_message=True)
+            if not approval_mode.get("auto_repair"):
+                self._badge.update_status("ok", f"{approval_mode['label']} ready")
+            elif repair_result.get("ok") and approval_mode.get("auto_commit"):
+                if commit_result and commit_result.get("ok"):
+                    if approval_mode.get("auto_push") and any(push_targets.values()):
+                        self._badge.update_status("ok", "Repair + Push completed")
+                    elif approval_mode.get("auto_push"):
+                        self._badge.update_status("warning", commit_warning or "Repair reached green; commit stayed local.")
+                    else:
+                        self._badge.update_status("ok", "Repair + Commit completed")
+                elif commit_result and commit_result.get("reason") == "clean":
+                    self._badge.update_status("warning", "Repair reached green; no new changes to commit.")
+                else:
+                    self._badge.update_status("warning", "Repair reached green, but the safe commit flow had issues.")
+            elif repair_result.get("ok"):
+                self._badge.update_status("ok", "Repair Only reached green")
+            elif repair_result.get("handoff_ready"):
+                self._badge.update_status("warning", f"{approval_mode['label']} produced a handoff")
+            else:
+                self._badge.update_status("warning", f"{approval_mode['label']} stopped")
+
+        self.after(0, _finish)
 
     def _run_plan(self):
         if not self._current_plan:
@@ -600,6 +958,9 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._run_log.clear()
         self._run_btn.configure(text="Running…", state="disabled")
         self._stop_btn.configure(state="normal")
+        self._one_click_btn.configure(state="disabled")
+        self._commit_btn.configure(state="disabled")
+        self._commit_push_btn.configure(state="disabled")
         self._badge.update_status("pending", "Running execution plan")
         self._run_thread.start()
 
@@ -615,6 +976,9 @@ class PanelTestDebugging(ctk.CTkFrame):
         def _finish():
             self._run_btn.configure(text="Run Plan", state="normal")
             self._stop_btn.configure(state="disabled")
+            self._one_click_btn.configure(state="normal")
+            self._apply_safety_gate(result.get("results") or [], result.get("ok"), executed=True)
+            self._refresh_repo_state()
             if result.get("ok"):
                 self._badge.update_status("ok", "Execution plan passed")
             else:
@@ -649,6 +1013,11 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._run_btn.configure(state="disabled")
         self._stop_btn.configure(state="normal")
         self._analyze_btn.configure(state="disabled")
+        self._one_click_btn.configure(state="disabled")
+        self._commit_btn.configure(state="disabled")
+        self._commit_push_btn.configure(state="disabled")
+        self._rollback_btn.configure(state="disabled")
+        self._rollback_push_btn.configure(state="disabled")
         self._badge.update_status("pending", "Starting repair loop")
         self._repair_thread = threading.Thread(
             target=self._repair_loop_worker,
@@ -695,7 +1064,9 @@ class PanelTestDebugging(ctk.CTkFrame):
             self._run_btn.configure(state="normal")
             self._stop_btn.configure(state="disabled")
             self._analyze_btn.configure(state="normal")
+            self._one_click_btn.configure(state="normal")
             self._refresh_repair_history()
+            self._apply_safety_gate(result.get("results") or [], result.get("ok"), executed=True)
             self._refresh_repo_state(force_message=True)
             if result.get("ok"):
                 self._badge.update_status("ok", "Repair loop reached green")
@@ -717,16 +1088,45 @@ class PanelTestDebugging(ctk.CTkFrame):
     def _refresh_repair_history(self):
         if not self._current_incident:
             self._current_repair_history = None
+            self._current_rollback_target = None
             self._replace_logbox(self._repair_artifacts_box, "Select an incident to inspect repair artifacts.")
             self._update_repair_artifact_buttons()
+            self._update_rollback_buttons()
             self._suggest_commit_message(force=True)
             return
 
         history = self._system.inspect_repair_history(self._current_incident)
         self._current_repair_history = history
+        self._current_rollback_target = self._system.resolve_rollback_snapshot(
+            self._repo_path_var.get().strip(),
+            history,
+        )
         self._replace_logbox(self._repair_artifacts_box, self._system.format_repair_history(history))
         self._update_repair_artifact_buttons()
+        self._update_rollback_buttons()
         self._suggest_commit_message(force=False)
+
+    def _reset_safety_gate(self):
+        gate = self._system.build_safety_gate(self._current_plan, results=[], run_ok=False, executed=False)
+        self._current_gate_state = gate
+        self._replace_logbox(self._gate_box, self._system.format_safety_gate(gate))
+        self._gate_badge.update_status("pending", "Gate pending")
+
+    def _apply_safety_gate(self, results, run_ok, executed=True):
+        gate = self._system.build_safety_gate(
+            self._current_plan,
+            results=results or [],
+            run_ok=bool(run_ok),
+            executed=bool(executed),
+        )
+        self._current_gate_state = gate
+        self._replace_logbox(self._gate_box, self._system.format_safety_gate(gate))
+        if gate.get("ok"):
+            self._gate_badge.update_status("ok", "Gate open")
+        elif gate.get("executed"):
+            self._gate_badge.update_status("warning", "Gate blocked")
+        else:
+            self._gate_badge.update_status("pending", "Gate pending")
 
     def _update_repair_artifact_buttons(self):
         latest = ((self._current_repair_history or {}).get("latest_attempt")) or {}
@@ -748,15 +1148,29 @@ class PanelTestDebugging(ctk.CTkFrame):
         repo_path = self._repo_path_var.get().strip()
         if not repo_path:
             self._current_repo_state = None
+            self._current_rollback_target = None
             self._replace_logbox(self._repo_state_box, "Select or map a repository first.")
             self._update_commit_buttons()
+            self._update_rollback_buttons()
             return
 
         repo_state = self._system.inspect_repo_state(repo_path)
         self._current_repo_state = repo_state
-        self._replace_logbox(self._repo_state_box, self._system.format_repo_state(repo_state))
+        self._current_rollback_target = self._system.resolve_rollback_snapshot(
+            repo_path,
+            self._current_repair_history or {},
+        )
+        repo_state_text = self._system.format_repo_state(repo_state)
+        if (self._current_rollback_target or {}).get("ok"):
+            repo_state_text += (
+                "\n\nRollback target:\n"
+                f"{self._current_rollback_target.get('ref')}  "
+                f"({self._current_rollback_target.get('ref_type')})"
+            )
+        self._replace_logbox(self._repo_state_box, repo_state_text)
         self._suggest_commit_message(force=force_message)
         self._update_commit_buttons()
+        self._update_rollback_buttons()
 
     def _suggest_commit_message(self, force=False):
         if not self._current_incident:
@@ -772,10 +1186,20 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._commit_msg_var.set(suggestion)
 
     def _update_commit_buttons(self):
-        enabled = bool((self._current_repo_state or {}).get("ok") and (self._current_repo_state or {}).get("dirty"))
+        enabled = bool(
+            (self._current_repo_state or {}).get("ok")
+            and (self._current_repo_state or {}).get("dirty")
+            and (self._current_gate_state or {}).get("ok")
+        )
         state = "normal" if enabled else "disabled"
         self._commit_btn.configure(state=state)
         self._commit_push_btn.configure(state=state)
+
+    def _update_rollback_buttons(self):
+        enabled = bool((self._current_rollback_target or {}).get("ok"))
+        state = "normal" if enabled else "disabled"
+        self._rollback_btn.configure(state=state)
+        self._rollback_push_btn.configure(state=state)
 
     def _start_safe_commit(self, push=False):
         if self._commit_thread and self._commit_thread.is_alive():
@@ -783,6 +1207,9 @@ class PanelTestDebugging(ctk.CTkFrame):
         repo_path = self._repo_path_var.get().strip()
         if not repo_path:
             self._badge.update_status("error", "Select or map a repository first")
+            return
+        if not (self._current_gate_state or {}).get("ok"):
+            self._badge.update_status("warning", "Safety gate is still blocked")
             return
         if not (self._current_repo_state or {}).get("dirty"):
             self._badge.update_status("warning", "No local changes to commit")
@@ -792,6 +1219,7 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._run_btn.configure(state="disabled")
         self._stop_btn.configure(state="disabled")
         self._analyze_btn.configure(state="disabled")
+        self._one_click_btn.configure(state="disabled")
         self._commit_btn.configure(state="disabled")
         self._commit_push_btn.configure(state="disabled")
         self._badge.update_status("pending", "Running safe commit flow")
@@ -824,6 +1252,7 @@ class PanelTestDebugging(ctk.CTkFrame):
         def _finish():
             self._run_btn.configure(state="normal")
             self._analyze_btn.configure(state="normal")
+            self._one_click_btn.configure(state="normal")
             self._refresh_repo_state()
             if result.get("ok"):
                 self._badge.update_status("ok", "Safe commit flow completed")
@@ -831,6 +1260,67 @@ class PanelTestDebugging(ctk.CTkFrame):
                 self._badge.update_status("warning", "No changes to commit")
             else:
                 self._badge.update_status("warning", "Safe commit flow finished with issues")
+
+        self.after(0, _finish)
+
+    def _start_rollback(self, push=False):
+        if self._rollback_thread and self._rollback_thread.is_alive():
+            return
+        repo_path = self._repo_path_var.get().strip()
+        if not repo_path:
+            self._badge.update_status("error", "Select or map a repository first")
+            return
+        if not (self._current_rollback_target or {}).get("ok"):
+            self._badge.update_status("error", "No rollback snapshot available")
+            return
+
+        self._run_log.clear()
+        self._run_btn.configure(state="disabled")
+        self._stop_btn.configure(state="disabled")
+        self._analyze_btn.configure(state="disabled")
+        self._one_click_btn.configure(state="disabled")
+        self._commit_btn.configure(state="disabled")
+        self._commit_push_btn.configure(state="disabled")
+        self._rollback_btn.configure(state="disabled")
+        self._rollback_push_btn.configure(state="disabled")
+        self._badge.update_status("pending", "Running rollback flow")
+        self._rollback_thread = threading.Thread(
+            target=self._rollback_worker,
+            args=(repo_path, push),
+            daemon=True,
+        )
+        self._rollback_thread.start()
+
+    def _rollback_worker(self, repo_path, push):
+        github_token = self.app_state.get("github_token") or self.cfg.get_github_token()
+        gitlab_token = self.app_state.get("gitlab_token") or self.cfg.get_gitlab_token()
+
+        def on_event(event):
+            msg = str(event.get("message") or "").rstrip()
+            if msg:
+                self.after(0, lambda text=msg: self._run_log.append(text))
+
+        result = self._system.rollback_to_snapshot(
+            repo_path=repo_path,
+            repair_history=self._current_repair_history or {},
+            on_event=on_event,
+            push_github=bool(push and self._push_github_var.get()),
+            push_gitlab=bool(push and self._push_gitlab_var.get()),
+            github_token=github_token,
+            gitlab_token=gitlab_token,
+        )
+
+        def _finish():
+            self._run_btn.configure(state="normal")
+            self._analyze_btn.configure(state="normal")
+            self._one_click_btn.configure(state="normal")
+            self._reset_safety_gate()
+            self._refresh_repo_state(force_message=True)
+            self._refresh_repair_history()
+            if result.get("ok"):
+                self._badge.update_status("ok", "Rollback completed")
+            else:
+                self._badge.update_status("warning", "Rollback finished with issues")
 
         self.after(0, _finish)
 
@@ -849,6 +1339,16 @@ class PanelTestDebugging(ctk.CTkFrame):
     def _clear_logs(self):
         self._run_log.clear()
         self._badge.update_status("pending", "Execution log cleared")
+
+    def _is_busy(self):
+        threads = [
+            self._run_thread,
+            self._repair_thread,
+            self._commit_thread,
+            self._rollback_thread,
+            self._one_click_thread,
+        ]
+        return any(thread and thread.is_alive() for thread in threads)
 
     def _open_path(self, path):
         if not path:

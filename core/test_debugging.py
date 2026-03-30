@@ -13,6 +13,7 @@ from core.git_manager import GitManager
 MAX_INCIDENTS = 50
 MAX_PLAN_STEPS = 12
 MAX_REPAIR_ATTEMPTS = 5
+SAFETY_GATE_CATEGORIES = ("typecheck", "test", "build")
 APP_ROOT = Path(__file__).resolve().parent.parent
 REPAIR_AGENT_PATH = APP_ROOT / "core" / "repair_agent.py"
 DEFAULT_REPAIR_COMMAND_TEMPLATE = (
@@ -55,6 +56,37 @@ SCRIPT_CATEGORIES = {
     "build": {"build"},
 }
 
+APPROVAL_MODES = {
+    "analyze_only": {
+        "label": "Analyze Only",
+        "description": "Analyze the repository and build the plan only. No repair, commit, or push.",
+        "auto_repair": False,
+        "auto_commit": False,
+        "auto_push": False,
+    },
+    "repair_only": {
+        "label": "Repair Only",
+        "description": "Analyze the repository and run the repair loop, but stop before commit.",
+        "auto_repair": True,
+        "auto_commit": False,
+        "auto_push": False,
+    },
+    "repair_commit": {
+        "label": "Repair + Commit",
+        "description": "Analyze, repair, and create a safe local commit once the gate is green.",
+        "auto_repair": True,
+        "auto_commit": True,
+        "auto_push": False,
+    },
+    "repair_push": {
+        "label": "Repair + Push",
+        "description": "Analyze, repair, commit safely, and push to the selected remotes.",
+        "auto_repair": True,
+        "auto_commit": True,
+        "auto_push": True,
+    },
+}
+
 
 class TestDebugSystem:
     def __init__(self):
@@ -63,6 +95,20 @@ class TestDebugSystem:
 
     def default_repair_command_template(self):
         return DEFAULT_REPAIR_COMMAND_TEMPLATE
+
+    def default_approval_mode(self):
+        return "repair_only"
+
+    def approval_mode_choices(self):
+        return [(key, data["label"]) for key, data in APPROVAL_MODES.items()]
+
+    def get_approval_mode(self, value=None):
+        key = str(value or "").strip() or self.default_approval_mode()
+        if key not in APPROVAL_MODES:
+            key = self.default_approval_mode()
+        mode = dict(APPROVAL_MODES[key])
+        mode["key"] = key
+        return mode
 
     # ---------- Incidents ----------
 
@@ -351,6 +397,84 @@ class TestDebugSystem:
             return f"Fix NovaDeploy failure: {clipped}"
         return "Fix NovaDeploy deployment failure"
 
+    def build_safety_gate(self, plan, results=None, run_ok=False, executed=False):
+        steps = list(plan or [])
+        results = list(results or [])
+        required_categories = []
+        for step in steps:
+            category = str(step.get("category") or "").strip().lower()
+            if category in SAFETY_GATE_CATEGORIES and category not in required_categories:
+                required_categories.append(category)
+
+        by_category = {}
+        for item in results:
+            step = item.get("step") or {}
+            category = str(step.get("category") or "").strip().lower()
+            by_category.setdefault(category, []).append(item)
+
+        checks = []
+        for category in required_categories:
+            category_results = by_category.get(category, [])
+            passed = [item for item in category_results if item.get("ok")]
+            failed = [item for item in category_results if not item.get("ok")]
+            if passed:
+                status = "passed"
+            elif failed:
+                status = "failed"
+            elif executed:
+                status = "not-run"
+            else:
+                status = "pending"
+            names = [
+                str(((item.get("step") or {}).get("name")) or "").strip()
+                for item in (passed or failed or category_results)
+                if str(((item.get("step") or {}).get("name")) or "").strip()
+            ]
+            checks.append(
+                {
+                    "category": category,
+                    "status": status,
+                    "steps": names,
+                }
+            )
+
+        if not steps:
+            return {
+                "ok": False,
+                "executed": False,
+                "required_categories": [],
+                "checks": [],
+                "summary": "Analyze the repository to build the safety gate.",
+            }
+
+        if not required_categories:
+            return {
+                "ok": bool(executed and run_ok),
+                "executed": bool(executed),
+                "required_categories": [],
+                "checks": [],
+                "summary": (
+                    "No required typecheck/test/build gates detected. Last validation passed."
+                    if executed and run_ok
+                    else "Run validation to open the safety gate."
+                ),
+            }
+
+        gate_ok = bool(executed and run_ok and all(item["status"] == "passed" for item in checks))
+        if gate_ok:
+            summary = "Safety gate open. Required checks passed."
+        elif executed:
+            summary = "Safety gate blocked. Required checks are not fully green."
+        else:
+            summary = "Run validation to evaluate required checks."
+        return {
+            "ok": gate_ok,
+            "executed": bool(executed),
+            "required_categories": required_categories,
+            "checks": checks,
+            "summary": summary,
+        }
+
     def format_repo_state(self, repo_state):
         if not repo_state.get("ok"):
             return repo_state.get("error", "Repository state unavailable.")
@@ -386,6 +510,29 @@ class TestDebugSystem:
             lines.append("Untracked files:")
             for item in untracked_files[:12]:
                 lines.append(item)
+        return "\n".join(lines)
+
+    def format_safety_gate(self, gate):
+        if not gate:
+            return "Safety gate not initialized."
+
+        lines = [str(gate.get("summary") or "Safety gate unavailable.")]
+        required = gate.get("required_categories") or []
+        if required:
+            lines.append("")
+            lines.append("Required checks:")
+            for item in gate.get("checks") or []:
+                status = str(item.get("status") or "pending").upper()
+                label = str(item.get("category") or "unknown")
+                step_names = ", ".join(item.get("steps") or [])
+                if step_names:
+                    lines.append(f"- {label}: {status} ({step_names})")
+                else:
+                    lines.append(f"- {label}: {status}")
+        elif gate.get("executed"):
+            lines.append("")
+            lines.append("No required typecheck/test/build gates were detected for this plan.")
+
         return "\n".join(lines)
 
     def _detect_package_manager(self, root):
@@ -885,6 +1032,145 @@ class TestDebugSystem:
                 "head": head,
             }
         return {"ok": True, "branch": branch, "tag": tag, "head": head}
+
+    def resolve_rollback_snapshot(self, repo_path, repair_history):
+        root = Path(repo_path).expanduser()
+        latest = ((repair_history or {}).get("latest_attempt")) or {}
+        for ref_type in ("snapshot_tag", "snapshot_branch"):
+            ref_name = str(latest.get(ref_type) or "").strip()
+            if not ref_name:
+                continue
+            resolved = self._git_ref(root, ["git", "rev-parse", ref_name])
+            if resolved:
+                return {
+                    "ok": True,
+                    "ref": ref_name,
+                    "ref_type": ref_type,
+                    "head": resolved,
+                }
+        return {
+            "ok": False,
+            "reason": "No rollback snapshot available for this repair attempt.",
+        }
+
+    def rollback_to_snapshot(
+        self,
+        repo_path,
+        repair_history,
+        on_event,
+        push_github=False,
+        push_gitlab=False,
+        github_token="",
+        gitlab_token="",
+    ):
+        root = Path(repo_path).expanduser()
+        target = self.resolve_rollback_snapshot(root, repair_history)
+        if not target.get("ok"):
+            on_event({"type": "rollback_error", "message": target.get("reason", "Rollback snapshot unavailable.")})
+            return {"ok": False, "target": target}
+
+        rescue_snapshot = self.create_safety_snapshot(root, label="pre-rollback")
+        if rescue_snapshot.get("ok"):
+            on_event(
+                {
+                    "type": "rollback_rescue_snapshot",
+                    "message": f"Pre-rollback snapshot created: {rescue_snapshot['branch']} | {rescue_snapshot['tag']}",
+                    "snapshot": rescue_snapshot,
+                }
+            )
+        else:
+            on_event(
+                {
+                    "type": "rollback_rescue_snapshot_skipped",
+                    "message": f"Pre-rollback snapshot skipped: {rescue_snapshot.get('reason')}",
+                    "snapshot": rescue_snapshot,
+                }
+            )
+
+        on_event({"type": "rollback_reset", "message": f"Resetting repository to snapshot {target['ref']}..."})
+        reset_result = subprocess.run(
+            ["git", "reset", "--hard", target["ref"]],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+        )
+        reset_output = (reset_result.stdout or "") + (reset_result.stderr or "")
+        if reset_output.strip():
+            on_event({"type": "rollback_reset_output", "message": reset_output.strip()})
+        if reset_result.returncode != 0:
+            on_event({"type": "rollback_error", "message": "Rollback reset failed."})
+            return {
+                "ok": False,
+                "target": target,
+                "rescue_snapshot": rescue_snapshot,
+            }
+
+        clean_result = subprocess.run(
+            ["git", "clean", "-fd"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+        )
+        clean_output = (clean_result.stdout or "") + (clean_result.stderr or "")
+        if clean_output.strip():
+            on_event({"type": "rollback_clean_output", "message": clean_output.strip()})
+
+        branch = self._git.get_current_branch(str(root)) or "main"
+        push_results = []
+        any_push_ok = False
+
+        if push_github:
+            env = os.environ.copy()
+            if github_token:
+                env.update({"GIT_ASKPASS": "echo", "GIT_USERNAME": "x-token", "GIT_PASSWORD": github_token})
+            push_result = subprocess.run(
+                ["git", "push", "--force-with-lease", "origin", branch],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            push_output = (push_result.stdout or "") + (push_result.stderr or "")
+            if push_output.strip():
+                on_event({"type": "rollback_push_output", "message": f"GitHub: {push_output.strip()}"})
+            ok_push = push_result.returncode == 0
+            push_results.append({"target": "github", "ok": ok_push})
+            any_push_ok = any_push_ok or ok_push
+
+        if push_gitlab:
+            env = os.environ.copy()
+            if gitlab_token:
+                env.update({"GIT_ASKPASS": "echo", "GIT_USERNAME": "oauth2", "GIT_PASSWORD": gitlab_token})
+            push_result = subprocess.run(
+                ["git", "push", "--force-with-lease", "gitlab", branch],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            push_output = (push_result.stdout or "") + (push_result.stderr or "")
+            if push_output.strip():
+                on_event({"type": "rollback_push_output", "message": f"GitLab: {push_output.strip()}"})
+            ok_push = push_result.returncode == 0
+            push_results.append({"target": "gitlab", "ok": ok_push})
+            any_push_ok = any_push_ok or ok_push
+
+        if push_results:
+            if all(item["ok"] for item in push_results):
+                on_event({"type": "rollback_push_done", "message": "Rollback push completed successfully."})
+            elif any_push_ok:
+                on_event({"type": "rollback_push_partial", "message": "Rollback push completed only partially."})
+            else:
+                on_event({"type": "rollback_push_failed", "message": "Rollback push failed."})
+
+        repo_state = self.inspect_repo_state(root)
+        return {
+            "ok": True if not push_results else any(item["ok"] for item in push_results),
+            "target": target,
+            "rescue_snapshot": rescue_snapshot,
+            "repo_state": repo_state,
+            "push_results": push_results,
+        }
 
     def safe_commit_and_push(
         self,
