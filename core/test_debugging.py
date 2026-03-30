@@ -373,6 +373,97 @@ class TestDebugSystem:
             "latest_attempt": latest_attempt,
         }
 
+    def new_automation_run_id(self, source="auto"):
+        prefix = str(source or "flow").strip().lower() or "flow"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        return f"{prefix}-{stamp}"
+
+    def inspect_automation_history(self, incident):
+        deployment_dir = Path(incident.get("deployment_dir") or "").expanduser()
+        history_file = deployment_dir / "automation-history.jsonl"
+        entries = []
+        if history_file.exists():
+            try:
+                for raw_line in history_file.read_text(encoding="utf-8").splitlines():
+                    raw_line = str(raw_line or "").strip()
+                    if not raw_line:
+                        continue
+                    payload = json.loads(raw_line)
+                    if isinstance(payload, dict):
+                        entries.append(payload)
+            except Exception:
+                entries = []
+
+        latest_entry = entries[-1] if entries else None
+        latest_run_id = str((latest_entry or {}).get("run_id") or "").strip()
+        latest_run_entries = [
+            item for item in entries
+            if str(item.get("run_id") or "").strip() == latest_run_id
+        ] if latest_run_id else []
+
+        status = str((latest_entry or {}).get("status") or "pending").strip().lower() or "pending"
+        badge_map = {
+            "ok": ("ok", "Flow healthy"),
+            "warning": ("warning", "Flow warning"),
+            "error": ("error", "Flow failed"),
+            "pending": ("pending", "Flow running"),
+            "info": ("info", "Flow info"),
+        }
+        badge_status, badge_text = badge_map.get(status, ("pending", "Flow running"))
+        if latest_entry:
+            badge_text = str(latest_entry.get("message") or badge_text).strip() or badge_text
+
+        return {
+            "ok": bool(entries),
+            "history_file": str(history_file),
+            "entries": entries[-40:],
+            "entry_count": len(entries),
+            "latest_entry": latest_entry,
+            "latest_run_id": latest_run_id,
+            "latest_run_entries": latest_run_entries[-20:],
+            "badge_status": badge_status,
+            "badge_text": badge_text,
+        }
+
+    def append_automation_history(
+        self,
+        incident,
+        *,
+        source="auto",
+        run_id="",
+        event="",
+        status="info",
+        message="",
+        approval_mode="",
+        approval_mode_label="",
+        metadata=None,
+    ):
+        deployment_dir_raw = str((incident or {}).get("deployment_dir") or "").strip()
+        if not deployment_dir_raw:
+            return {"ok": False, "reason": "deployment dir unavailable"}
+        deployment_dir = Path(deployment_dir_raw).expanduser()
+        deployment_dir.mkdir(parents=True, exist_ok=True)
+        history_file = deployment_dir / "automation-history.jsonl"
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "project_id": str((incident or {}).get("project_id") or "").strip(),
+            "deployment_id": str((incident or {}).get("deployment_id") or "").strip(),
+            "source": str(source or "auto").strip() or "auto",
+            "run_id": str(run_id or "").strip(),
+            "event": str(event or "").strip(),
+            "status": str(status or "info").strip().lower() or "info",
+            "message": str(message or "").strip(),
+            "approval_mode": str(approval_mode or "").strip(),
+            "approval_mode_label": str(approval_mode_label or "").strip(),
+            "metadata": metadata or {},
+        }
+        self._append_text(history_file, json.dumps(payload, sort_keys=True) + "\n")
+        return {
+            "ok": True,
+            "history_file": str(history_file),
+            "entry": payload,
+        }
+
     def _read_json(self, path):
         try:
             return json.loads(Path(path).read_text(encoding="utf-8"))
@@ -1705,6 +1796,48 @@ class TestDebugSystem:
             if item.get("last_message_file"):
                 details += " | ai-summary"
             lines.append(details)
+
+        return "\n".join(lines)
+
+    def format_automation_history(self, history):
+        entries = history.get("entries") or []
+        if not entries:
+            return "No automation activity recorded yet for this incident."
+
+        latest = history.get("latest_entry") or entries[-1]
+        lines = [
+            f"History file: {history.get('history_file')}",
+            f"Entries: {history.get('entry_count') or len(entries)}",
+            f"Latest status: {str(latest.get('status') or 'pending').upper()}",
+            f"Latest source: {latest.get('source') or 'unknown'}",
+            f"Latest event: {latest.get('event') or 'unknown'}",
+            f"Latest message: {latest.get('message') or 'No message'}",
+        ]
+        run_entries = history.get("latest_run_entries") or []
+        if run_entries:
+            lines.extend(["", "Latest run:"])
+            for item in run_entries[-8:]:
+                timestamp = str(item.get("timestamp") or "").strip()
+                stamp = timestamp.replace("T", " ")[:19] if timestamp else "unknown-time"
+                status = str(item.get("status") or "info").upper()
+                source = str(item.get("source") or "flow").strip()
+                event = str(item.get("event") or "event").strip()
+                message = str(item.get("message") or "").strip()
+                lines.append(f"{stamp} | {source} | {status} | {event}")
+                if message:
+                    lines.append(f"  {message}")
+        else:
+            lines.extend(["", "Recent activity:"])
+            for item in entries[-8:]:
+                timestamp = str(item.get("timestamp") or "").strip()
+                stamp = timestamp.replace("T", " ")[:19] if timestamp else "unknown-time"
+                status = str(item.get("status") or "info").upper()
+                source = str(item.get("source") or "flow").strip()
+                event = str(item.get("event") or "event").strip()
+                message = str(item.get("message") or "").strip()
+                lines.append(f"{stamp} | {source} | {status} | {event}")
+                if message:
+                    lines.append(f"  {message}")
 
         return "\n".join(lines)
 

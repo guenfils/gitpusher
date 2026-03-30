@@ -37,6 +37,7 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._current_incident = None
         self._current_analysis = None
         self._current_plan = []
+        self._current_automation_history = None
         self._current_repair_history = None
         self._current_repo_state = None
         self._current_rollback_target = None
@@ -165,6 +166,19 @@ class PanelTestDebugging(ctk.CTkFrame):
         SecondaryButton(detail_btn_row, text="Open Exported Log", width=140, height=34, command=self._open_incident_log).pack(
             side="left"
         )
+
+        automation_card = Card(scroll)
+        automation_card.pack(fill="x", pady=(0, PAD_SM))
+        automation_header = ctk.CTkFrame(automation_card, fg_color="transparent")
+        automation_header.pack(fill="x", padx=PAD, pady=(PAD_SM, 6))
+        Label(automation_header, text="Automation Status", size=13, bold=True).pack(side="left")
+        self._automation_badge = StatusBadge(automation_header, status="pending", text="No automation activity")
+        self._automation_badge.pack(side="right", padx=(8, 0))
+        SecondaryButton(
+            automation_header, text="Refresh Status", width=120, height=32, command=self._refresh_automation_history
+        ).pack(side="right")
+        self._automation_box = LogBox(automation_card, height=150)
+        self._automation_box.pack(fill="x", padx=PAD, pady=(0, PAD_SM))
 
         repo_card = Card(scroll)
         repo_card.pack(fill="x", pady=(0, PAD_SM))
@@ -482,9 +496,11 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._approval_mode_var.set(
             self._approval_mode_key_to_label.get(approval_mode["key"], approval_mode["label"])
         )
+        self._replace_logbox(self._automation_box, "No automation activity recorded yet for this incident.")
         self._replace_logbox(self._repair_artifacts_box, "Select an incident to inspect repair artifacts.")
         self._replace_logbox(self._gate_box, "Run validation to evaluate required checks.")
         self._replace_logbox(self._repo_state_box, "Select and analyze a repository to inspect git state.")
+        self._automation_badge.update_status("pending", "No automation activity")
         self._apply_approval_mode_ui(approval_mode)
         self._update_repair_artifact_buttons()
         self._reset_safety_gate()
@@ -597,6 +613,13 @@ class PanelTestDebugging(ctk.CTkFrame):
             self._select_incident(matched)
             if auto:
                 self._badge.update_status("info", f"Auto-ingested incident: {self._short_id(matched.get('deployment_id'))}")
+                self._record_automation_event(
+                    incident=matched,
+                    source="auto",
+                    event="incident_ingested",
+                    status="info",
+                    message=f"Incident auto-ingested for {self._short_id(matched.get('deployment_id'))}.",
+                )
         self.cfg.delete("test_debugging_pending_incident")
         if auto:
             self._schedule_auto_run(matched)
@@ -607,9 +630,20 @@ class PanelTestDebugging(ctk.CTkFrame):
         incident_id = str((incident or {}).get("id") or "").strip()
         if not incident_id:
             return
-        self.after(250, lambda value=incident_id: self._auto_run_selected_incident(value))
+        mode = self._selected_approval_mode()
+        run_id = self._system.new_automation_run_id("auto")
+        self._record_automation_event(
+            incident=incident,
+            source="auto",
+            run_id=run_id,
+            event="auto_run_scheduled",
+            status="pending",
+            message=f"Auto-run scheduled in {mode['label']} mode.",
+            mode=mode,
+        )
+        self.after(250, lambda value=incident_id, current_run_id=run_id: self._auto_run_selected_incident(value, current_run_id))
 
-    def _auto_run_selected_incident(self, incident_id):
+    def _auto_run_selected_incident(self, incident_id, run_id=""):
         if not self.winfo_exists():
             return
         if not self._auto_run_var.get() or self._is_busy():
@@ -619,12 +653,20 @@ class PanelTestDebugging(ctk.CTkFrame):
             return
         repo_path = self._repo_path_var.get().strip()
         if not repo_path:
+            self._record_automation_event(
+                source="auto",
+                run_id=run_id,
+                event="auto_run_skipped",
+                status="warning",
+                message="Auto-run skipped because no repository map is saved yet.",
+                mode=self._selected_approval_mode(),
+            )
             self._badge.update_status("warning", "Auto-run skipped: save a repository map for this project first")
             return
         mode = self._selected_approval_mode()
         self._run_log.append(f"[auto-run] Starting {mode['label']} for {self._short_id(current.get('deployment_id'))}")
         self._badge.update_status("pending", f"Auto-running {mode['label']}")
-        self._start_one_click_flow()
+        self._start_one_click_flow(source="auto", run_id=run_id)
 
     def _render_incident_list(self, incidents):
         for widget in self._incident_list.winfo_children():
@@ -674,6 +716,7 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._current_incident = incident
         self._current_analysis = None
         self._current_plan = []
+        self._current_automation_history = None
         self._current_repair_history = None
         self._current_repo_state = None
         self._current_rollback_target = None
@@ -716,6 +759,7 @@ class PanelTestDebugging(ctk.CTkFrame):
         else:
             repair_command = self._system.default_repair_command_template()
         self._repair_cmd_var.set(repair_command)
+        self._refresh_automation_history()
         self._refresh_repair_history()
         self._refresh_repo_state()
         self._badge.update_status("info", f"Incident selected: {self._short_id(incident.get('deployment_id'))}")
@@ -810,7 +854,7 @@ class PanelTestDebugging(ctk.CTkFrame):
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _start_one_click_flow(self):
+    def _start_one_click_flow(self, source="manual", run_id=""):
         if not self._current_incident:
             self._badge.update_status("error", "Select an incident first")
             return
@@ -825,6 +869,7 @@ class PanelTestDebugging(ctk.CTkFrame):
             return
 
         approval_mode = self._selected_approval_mode()
+        flow_run_id = str(run_id or "").strip() or self._system.new_automation_run_id(source)
         push_targets = {
             "github": bool(self._push_github_var.get()),
             "gitlab": bool(self._push_gitlab_var.get()),
@@ -840,15 +885,32 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._commit_push_btn.configure(state="disabled")
         self._rollback_btn.configure(state="disabled")
         self._rollback_push_btn.configure(state="disabled")
+        self._record_automation_event(
+            source=source,
+            run_id=flow_run_id,
+            event="flow_started",
+            status="pending",
+            message=f"Started {approval_mode['label']} flow.",
+            mode=approval_mode,
+            metadata={"push_targets": push_targets},
+        )
         self._badge.update_status("pending", f"Running {approval_mode['label']} flow")
         self._one_click_thread = threading.Thread(
             target=self._one_click_flow_worker,
-            args=(repo_path, dict(self._current_incident), self._stop_event, dict(approval_mode), dict(push_targets)),
+            args=(
+                repo_path,
+                dict(self._current_incident),
+                self._stop_event,
+                dict(approval_mode),
+                dict(push_targets),
+                str(source or "manual"),
+                flow_run_id,
+            ),
             daemon=True,
         )
         self._one_click_thread.start()
 
-    def _one_click_flow_worker(self, repo_path, incident, stop_event, approval_mode, push_targets):
+    def _one_click_flow_worker(self, repo_path, incident, stop_event, approval_mode, push_targets, source, run_id):
         analysis = self._system.analyze_repository(repo_path)
         plan = analysis.get("plan") or []
         repair_result = None
@@ -865,6 +927,15 @@ class PanelTestDebugging(ctk.CTkFrame):
 
         self.after(0, _apply_analysis)
         if not analysis.get("ok") or not plan:
+            self._record_automation_event(
+                incident=incident,
+                source=source,
+                run_id=run_id,
+                event="flow_analysis_failed",
+                status="error",
+                message=analysis.get("error", "Analysis failed or no execution plan was detected."),
+                mode=approval_mode,
+            )
             def _finish_failed():
                 self._run_btn.configure(state="normal")
                 self._stop_btn.configure(state="disabled")
@@ -918,26 +989,68 @@ class PanelTestDebugging(ctk.CTkFrame):
             if repair_result is not None:
                 self._apply_safety_gate(repair_result.get("results") or [], repair_result.get("ok"), executed=True)
             self._refresh_repo_state(force_message=True)
+            automation_status = "warning"
+            automation_event = "flow_stopped"
+            automation_message = f"{approval_mode['label']} stopped."
             if not approval_mode.get("auto_repair"):
+                automation_status = "ok"
+                automation_event = "flow_ready"
+                automation_message = f"{approval_mode['label']} analysis completed."
                 self._badge.update_status("ok", f"{approval_mode['label']} ready")
             elif repair_result.get("ok") and approval_mode.get("auto_commit"):
                 if commit_result and commit_result.get("ok"):
                     if approval_mode.get("auto_push") and any(push_targets.values()):
+                        automation_status = "ok"
+                        automation_event = "flow_pushed"
+                        automation_message = "Repair reached green and was pushed successfully."
                         self._badge.update_status("ok", "Repair + Push completed")
                     elif approval_mode.get("auto_push"):
+                        automation_status = "warning"
+                        automation_event = "flow_commit_local_only"
+                        automation_message = commit_warning or "Repair reached green; commit stayed local."
                         self._badge.update_status("warning", commit_warning or "Repair reached green; commit stayed local.")
                     else:
+                        automation_status = "ok"
+                        automation_event = "flow_committed"
+                        automation_message = "Repair reached green and was committed safely."
                         self._badge.update_status("ok", "Repair + Commit completed")
                 elif commit_result and commit_result.get("reason") == "clean":
+                    automation_status = "warning"
+                    automation_event = "flow_clean"
+                    automation_message = "Repair reached green, but there were no new changes to commit."
                     self._badge.update_status("warning", "Repair reached green; no new changes to commit.")
                 else:
+                    automation_status = "warning"
+                    automation_event = "flow_commit_issue"
+                    automation_message = "Repair reached green, but the safe commit flow had issues."
                     self._badge.update_status("warning", "Repair reached green, but the safe commit flow had issues.")
             elif repair_result.get("ok"):
+                automation_status = "ok"
+                automation_event = "flow_green"
+                automation_message = "Repair loop reached green."
                 self._badge.update_status("ok", "Repair Only reached green")
             elif repair_result.get("handoff_ready"):
+                automation_status = "warning"
+                automation_event = "flow_handoff_ready"
+                automation_message = f"{approval_mode['label']} produced a repair handoff."
                 self._badge.update_status("warning", f"{approval_mode['label']} produced a handoff")
             else:
                 self._badge.update_status("warning", f"{approval_mode['label']} stopped")
+            self._record_automation_event(
+                incident=incident,
+                source=source,
+                run_id=run_id,
+                event=automation_event,
+                status=automation_status,
+                message=automation_message,
+                mode=approval_mode,
+                metadata={
+                    "repair_ok": bool((repair_result or {}).get("ok")),
+                    "handoff_ready": bool((repair_result or {}).get("handoff_ready")),
+                    "commit_ok": bool((commit_result or {}).get("ok")),
+                    "commit_reason": (commit_result or {}).get("reason") or "",
+                },
+            )
 
         self.after(0, _finish)
 
@@ -1105,6 +1218,21 @@ class PanelTestDebugging(ctk.CTkFrame):
         self._update_repair_artifact_buttons()
         self._update_rollback_buttons()
         self._suggest_commit_message(force=False)
+
+    def _refresh_automation_history(self):
+        if not self._current_incident:
+            self._current_automation_history = None
+            self._replace_logbox(self._automation_box, "No automation activity recorded yet for this incident.")
+            self._automation_badge.update_status("pending", "No automation activity")
+            return
+
+        history = self._system.inspect_automation_history(self._current_incident)
+        self._current_automation_history = history
+        self._replace_logbox(self._automation_box, self._system.format_automation_history(history))
+        self._automation_badge.update_status(
+            history.get("badge_status") or "pending",
+            history.get("badge_text") or "No automation activity",
+        )
 
     def _reset_safety_gate(self):
         gate = self._system.build_safety_gate(self._current_plan, results=[], run_ok=False, executed=False)
@@ -1361,3 +1489,33 @@ class PanelTestDebugging(ctk.CTkFrame):
         if len(value) <= 14:
             return value or "—"
         return value[:6] + "..." + value[-6:]
+
+    def _record_automation_event(
+        self,
+        *,
+        incident=None,
+        source="auto",
+        run_id="",
+        event="",
+        status="info",
+        message="",
+        mode=None,
+        metadata=None,
+    ):
+        incident = incident or self._current_incident
+        if not incident:
+            return
+        mode = mode or {}
+        self._system.append_automation_history(
+            incident,
+            source=source,
+            run_id=run_id,
+            event=event,
+            status=status,
+            message=message,
+            approval_mode=(mode.get("key") or ""),
+            approval_mode_label=(mode.get("label") or ""),
+            metadata=metadata,
+        )
+        if self.winfo_exists():
+            self.after(0, self._refresh_automation_history)
