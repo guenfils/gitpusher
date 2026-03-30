@@ -6,6 +6,8 @@ import os
 import shlex
 import shutil
 import subprocess
+import tempfile
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -200,6 +202,12 @@ class TestDebugSystem:
         bin_dir = str((self._node_runtime or {}).get("bin_dir") or "").strip()
         if bin_dir:
             env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+        tmp_root = Path(tempfile.gettempdir()) / "git-pusher-runtime"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        env.setdefault("TMPDIR", str(tmp_root))
+        env.setdefault("TEMP", str(tmp_root))
+        env.setdefault("TMP", str(tmp_root))
+        env.setdefault("XDG_CACHE_HOME", str(tmp_root / "xdg-cache"))
         return env
 
     def node_runtime_summary(self):
@@ -758,6 +766,7 @@ class TestDebugSystem:
         steps = []
         steps.extend(
             self._steps_from_manifest(
+                root,
                 package_manager,
                 ".",
                 root_manifest or {},
@@ -772,6 +781,7 @@ class TestDebugSystem:
             if manifest["path"] == ".":
                 continue
             workspace_steps = self._steps_from_manifest(
+                root,
                 package_manager,
                 manifest["path"],
                 manifest,
@@ -799,15 +809,24 @@ class TestDebugSystem:
 
         return steps
 
-    def _steps_from_manifest(self, package_manager, relative_path, manifest, prefer_root=False):
+    def _steps_from_manifest(self, repo_root, package_manager, relative_path, manifest, prefer_root=False):
         scripts = manifest.get("scripts") or {}
         steps = []
         for category, variants in SCRIPT_CATEGORIES.items():
             script_name = self._find_script_name(scripts, variants)
             if not script_name:
                 continue
+            script_body = str(scripts.get(script_name) or "").strip()
+            if self._should_skip_root_turbo_wrapper(repo_root, relative_path, package_manager, script_body):
+                continue
             scope_name = "repo" if relative_path == "." else relative_path
-            command = self._build_script_command(package_manager, relative_path, script_name)
+            command = self._build_script_command(
+                repo_root,
+                package_manager,
+                relative_path,
+                script_name,
+                script_body=script_body,
+            )
             if not command:
                 continue
             label = script_name if prefer_root else f"{scope_name}: {script_name}"
@@ -828,10 +847,13 @@ class TestDebugSystem:
                 return candidate
         return None
 
-    def _build_script_command(self, package_manager, relative_path, script_name):
+    def _build_script_command(self, repo_root, package_manager, relative_path, script_name, script_body=""):
         target = "." if relative_path in ("", ".") else relative_path
         quoted_target = shlex.quote(target)
         quoted_script = shlex.quote(script_name)
+        turbo_command = self._build_turbo_root_command(repo_root, target, package_manager, script_body)
+        if turbo_command:
+            return turbo_command
         if package_manager == "pnpm":
             if target == ".":
                 return f"pnpm {quoted_script}"
@@ -849,6 +871,51 @@ class TestDebugSystem:
                 return f"bun run {quoted_script}"
             return f"bun --cwd {quoted_target} run {quoted_script}"
         return None
+
+    def _build_turbo_root_command(self, repo_root, target, package_manager, script_body):
+        if target != "." or package_manager != "pnpm":
+            return ""
+        body = str(script_body or "").strip()
+        if not body.startswith("turbo run "):
+            return ""
+
+        try:
+            tokens = shlex.split(body)
+        except ValueError:
+            return ""
+        if len(tokens) < 3 or tokens[0] != "turbo" or tokens[1] != "run":
+            return ""
+
+        cache_dir = self._turbo_cache_dir(repo_root)
+        extra_args = tokens[2:]
+        command_parts = ["pnpm", "exec", "turbo", "run"]
+        command_parts.extend(extra_args)
+        command_parts.extend(
+            [
+                "--cache-dir",
+                str(cache_dir),
+                "--summarize=false",
+                "--log-order=stream",
+                "--output-logs=full",
+            ]
+        )
+        return " ".join(shlex.quote(part) for part in command_parts)
+
+    def _should_skip_root_turbo_wrapper(self, repo_root, relative_path, package_manager, script_body):
+        if relative_path != "." or package_manager != "pnpm":
+            return False
+        body = str(script_body or "").strip()
+        if not body.startswith("turbo run "):
+            return False
+        turbo_json = Path(repo_root).expanduser() / "turbo.json"
+        return turbo_json.exists()
+
+    def _turbo_cache_dir(self, repo_root):
+        root = Path(repo_root).expanduser().resolve()
+        digest = hashlib.sha1(str(root).encode("utf-8")).hexdigest()[:12]
+        cache_dir = Path(tempfile.gettempdir()) / "git-pusher-turbo-cache" / f"{root.name}-{digest}"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
 
     def _contains_skip_dir(self, parts):
         return any(part in SKIP_DIRS for part in parts)
